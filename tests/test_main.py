@@ -7,6 +7,8 @@ from unittest.mock import patch
 from main import (
     App, RestrictedSaveUnpickler, SAVE_FORMAT, SAVE_SCHEMA_VERSION,
 )
+from systems.agents.goals import Belief, Goal, Intention
+from systems.agents.experiments import ExperimentState, PriceExperiment
 from systems.ekonomi_core import World
 
 
@@ -39,6 +41,59 @@ class AppSaveTests(unittest.TestCase):
 
     def test_save_is_atomic_and_reports_success(self):
         world = World(seed=42, n_pop=12)
+        citizen = world.citizens[0]
+        citizen.bdi.beliefs["test"] = Belief(
+            "test", True, 1.0, "test_source", observed_day=world.day
+        )
+        citizen.bdi.desires = [
+            Goal("test_goal", conditions={"ready": True}, priority=0.5)
+        ]
+        citizen.bdi.intention = Intention(
+            "test_goal", ("test_action",), world.day
+        )
+        citizen.adaptive_learning.update(
+            "test_context", "test_arm", -0.5, world.day
+        )
+        citizen.adaptive_learning.remember(
+            "test_context", "test_arm", {"survival": 0.5},
+            {"survival": 1.0}, world.day,
+        )
+        citizen.experiments = ExperimentState(
+            active=PriceExperiment(
+                id=1,
+                business_id=3,
+                product="retail_goods",
+                hypothesis="A modest price change improves net sales.",
+                baseline_multiplier=1.0,
+                treatment_multiplier=1.05,
+                uncertainty=0.5,
+                expected_value_of_information=100_000.0,
+                estimated_risk=20_000.0,
+                risk_budget=30_000.0,
+                started_day=world.day,
+            ),
+            next_experiment_id=2,
+        )
+        citizen.memory.record(
+            world.day, "investment", "sale", {"asset": "KOTA"},
+            "realized return -10.0%", False, impact=0.1, value=-0.1,
+        )
+        other_citizen = world.citizens[1]
+        for _ in range(5):
+            world.record_social_interaction(
+                citizen, other_citizen, "worked_together", True,
+                "saved relationship",
+            )
+        partnership_id = world.propose_partnership(citizen, other_citizen)
+        self.assertTrue(
+            world.respond_partnership(other_citizen, partnership_id, True)
+        )
+        for value in (-1.0, -0.5, 0.0, 0.5, 1.0):
+            citizen.knowledge.observe(
+                world.day, "personal_experience", f"sale:{value}",
+                {"market_momentum": value, "realized_return": value},
+                context={"asset": "KOTA"},
+            )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "saves" / "slot1.sav"
             with patch("main.SAVE_PATH", path):
@@ -56,6 +111,55 @@ class AppSaveTests(unittest.TestCase):
                 )
                 saved_world = payload["world"]
                 self.assertEqual(saved_world.seed, world.seed)
+                self.assertEqual(
+                    saved_world.social_relationship(
+                        saved_world.citizens[0], saved_world.citizens[1]
+                    )["status"],
+                    "active",
+                )
+                self.assertEqual(
+                    saved_world.family_partner(saved_world.citizens[0]).id,
+                    saved_world.citizens[1].id,
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].bdi.beliefs["test"].source,
+                    "test_source",
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].bdi.desires[0].id,
+                    "test_goal",
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].bdi.intention.action_ids,
+                    ("test_action",),
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].adaptive_learning.mean_reward(
+                        "test_context", "test_arm"
+                    ),
+                    -0.5,
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].adaptive_learning.pending.arm,
+                    "test_arm",
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].experiments.active.hypothesis,
+                    "A modest price change improves net sales.",
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].memory.episodes[0].value,
+                    -0.1,
+                )
+                self.assertEqual(
+                    saved_world.citizens[0].knowledge.query(
+                        concept="market_momentum",
+                        other_concept="realized_return",
+                        context={"asset": "KOTA"},
+                        status="validated",
+                    )[0].status,
+                    "validated",
+                )
                 self.assertFalse(path.with_name(path.name + ".tmp").exists())
                 self.assertIn("GAME TERSIMPAN", app.scene.messages)
 
@@ -145,6 +249,9 @@ class AppSaveTests(unittest.TestCase):
 
     def test_v1_save_schema_migrates_to_current_version(self):
         world = World(seed=24, n_pop=12)
+        for citizen in world.citizens:
+            del citizen.bdi
+            del citizen.adaptive_learning
         payload = {
             "format": SAVE_FORMAT,
             "schema_version": 1,
@@ -170,6 +277,14 @@ class AppSaveTests(unittest.TestCase):
                     app.scene.world.ledger.schema_version,
                     world.ledger.schema_version,
                 )
+                self.assertTrue(all(
+                    hasattr(citizen, "bdi")
+                    for citizen in app.scene.world.citizens
+                ))
+                self.assertTrue(all(
+                    hasattr(citizen, "adaptive_learning")
+                    for citizen in app.scene.world.citizens
+                ))
 
     def test_ledger_schema_mismatch_is_rejected(self):
         world = World(seed=25, n_pop=12)

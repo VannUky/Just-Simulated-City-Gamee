@@ -486,6 +486,26 @@ class EconomyCoreTests(unittest.TestCase):
         self.assertAlmostEqual(contract["gross_amount"], price + tax)
         self.assertEqual(world.reconcile_ledger(), {})
 
+    def test_goods_purchase_rounding_never_exceeds_available_funds(self):
+        world = World(seed=23, n_pop=12)
+        buyer, owner = world.citizens[:2]
+        available = 3_149_403.3271747134
+        world.set_cash(owner, 100_000_000.0)
+        world.set_cash(buyer, available)
+        self.assertTrue(world.found_business(owner, "farm", force=True))
+        farm = owner.business
+        farm.stock = 100.0
+        farm.price = 96_431.24081723612
+        world.policy.tax_ppn = 0.11
+        world._initialize_ledger()
+
+        bought = world.buy_goods(buyer, 100.0)
+
+        self.assertGreater(bought, 0.0)
+        self.assertGreaterEqual(buyer.cash, 0.0)
+        self.assertLess(buyer.cash, available * 2e-14)
+        self.assertEqual(world.reconcile_ledger(), {})
+
     def test_market_prices_respond_to_observed_shortage_and_surplus(self):
         world = World(seed=23, n_pop=12)
         owner = world.citizens[0]

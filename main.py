@@ -22,6 +22,15 @@ except ImportError as error:
     raise SystemExit("Pygame belum tersedia. Aktifkan .venv dan install requirements.txt terlebih dahulu.") from error
 
 from systems.accounting import AccountingLedger, JournalEntry, LedgerAccount, Posting
+from systems.agents.memory import EpisodicMemory, MemoryEpisode, MemorySummary
+from systems.agents.knowledge import (
+    Concept, KnowledgeClaim, KnowledgeGraph, KnowledgeObservation,
+)
+from systems.agents.goals import BDIState, Belief, Goal, Intention
+from systems.agents.learning import ArmStats, LearningState, PendingOutcome
+from systems.agents.experiments import (
+    ExperimentResult, ExperimentState, PriceExperiment,
+)
 from systems.ekonomi_core import (
     Asset, Bank, Business, Citizen, Hall, House, Loan, Lot, Market, Policy,
     World,
@@ -47,6 +56,23 @@ class RestrictedSaveUnpickler(pickle.Unpickler):
         ("systems.accounting", "JournalEntry"): JournalEntry,
         ("systems.accounting", "LedgerAccount"): LedgerAccount,
         ("systems.accounting", "Posting"): Posting,
+        ("systems.agents.memory", "EpisodicMemory"): EpisodicMemory,
+        ("systems.agents.memory", "MemoryEpisode"): MemoryEpisode,
+        ("systems.agents.memory", "MemorySummary"): MemorySummary,
+        ("systems.agents.knowledge", "Concept"): Concept,
+        ("systems.agents.knowledge", "KnowledgeClaim"): KnowledgeClaim,
+        ("systems.agents.knowledge", "KnowledgeGraph"): KnowledgeGraph,
+        ("systems.agents.knowledge", "KnowledgeObservation"): KnowledgeObservation,
+        ("systems.agents.goals", "BDIState"): BDIState,
+        ("systems.agents.goals", "Belief"): Belief,
+        ("systems.agents.goals", "Goal"): Goal,
+        ("systems.agents.goals", "Intention"): Intention,
+        ("systems.agents.learning", "ArmStats"): ArmStats,
+        ("systems.agents.learning", "LearningState"): LearningState,
+        ("systems.agents.learning", "PendingOutcome"): PendingOutcome,
+        ("systems.agents.experiments", "ExperimentResult"): ExperimentResult,
+        ("systems.agents.experiments", "ExperimentState"): ExperimentState,
+        ("systems.agents.experiments", "PriceExperiment"): PriceExperiment,
         ("systems.ekonomi_core", "Asset"): Asset,
         ("systems.ekonomi_core", "Bank"): Bank,
         ("systems.ekonomi_core", "Business"): Business,

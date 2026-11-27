@@ -9,6 +9,43 @@ import random
 from collections import deque
 
 from systems.accounting import AccountingLedger, ledgered_transaction
+from systems.agents.actions import (
+    available_actions, execute_action, planning_state,
+)
+from systems.agents.goals import (
+    BDIState, Intention, form_goals, update_beliefs,
+)
+from systems.agents.learning import (
+    LearningState, learning_context, objective_weights, outcome_snapshot,
+    settle_pending, social_contact_count,
+)
+from systems.agents.memory import EpisodicMemory
+from systems.agents.knowledge import KnowledgeGraph
+from systems.agents.experiments import (
+    ExperimentState, begin_experiment_day, capture_experiment_market,
+    consider_price_experiment, finish_experiment_day,
+    share_experiment_result as _share_experiment_result,
+)
+from systems.agents.social import (
+    consider_organization, consider_social_action, end_relationship,
+    ensure_social_state, new_social_state, observe_action, propose_organization,
+    propose_trade_cooperation, propose_organization_rule,
+    record_interaction, record_trade_interaction,
+    relationship, reputation, respond_organization_invitation,
+    respond_trade_offer, share_knowledge, vote_organization_rule,
+)
+from systems.agents.family import (
+    active_partner, appoint_guardian, children_of, consider_family_action,
+    consider_teaching, ensure_family_state, family_heirs, guardians_of,
+    handle_death, handle_departure, new_family_state, parents_of,
+    propose_partnership, register_birth, respond_partnership, siblings_of,
+    teach_knowledge,
+)
+from systems.agents.lifecycle import (
+    advance_age, consider_births, daily_mortality_probability, food_payer,
+    is_adult,
+)
+from systems.agents.planner import BoundedPlanner
 from game.names_data import random_name
 
 HPD, DPM, DPY = 24, 30, 360          # jam/hari, hari/bulan, hari/tahun
@@ -19,6 +56,7 @@ TICKS_PER_DAY = 8                    # titik harga intrahari untuk candlestick
 PROD_PER_WORKER = 4.5                # unit barang per pekerja per hari
 LOT_PRICE = 30_000_000
 BUILD_COST = 15_000_000
+AGENT_PLANNER = BoundedPlanner(max_depth=3, max_expansions=64)
 STARTUP = {
     "shop": 15_000_000, "factory": 35_000_000, "farm": 8_000_000,
     "showroom": 35_000_000, "car_factory": 120_000_000,
@@ -280,6 +318,7 @@ class Business:
         }.get(kind, 44_000.0)
         self.markup = 0.38           # khusus toko
         self.cost_avg = 32_000.0     # khusus toko: harga beli rata-rata
+        self.innovation_price_multiplier = 1.0
         self.rev = self.exp = 0.0
         self.last_profit = 0.0
         self.loss_months = 0
@@ -517,19 +556,30 @@ class Bank:
 
 # ----------------------------------------------------------------------------- warga
 class Citizen:
-    def __init__(self, w, cid, young=False):
+    def __init__(self, w, cid, young=False, child=False):
         r = w.rng
         bt = r.betavariate
         self.w, self.id = w, cid
         self.female = r.random() < 0.5
         self.name = random_name(self.female, r)
-        self.age = r.uniform(18, 26) if young else r.uniform(18, 48)
+        self.age = 0.0 if child else (
+            r.uniform(18, 26) if young else r.uniform(18, 48)
+        )
         self.risk, self.greed, self.frugal = bt(2, 2), bt(2, 2), bt(2, 2)
         self.herd, self.optimism, self.patience = bt(2, 2.5), bt(2, 2), bt(2, 2)
-        self.skill, self.entre = bt(2.2, 2.2), bt(1.3, 3.5)
+        self.skill, self.entre = (
+            (r.uniform(0.02, 0.08), r.uniform(0.0, 0.12))
+            if child else (bt(2.2, 2.2), bt(1.3, 3.5))
+        )
         self.persuasion = bt(2, 2)
-        self.construction_skill = bt(1.5, 3.0)
-        self.repair_skill = bt(1.5, 3.0)
+        self.construction_skill = r.uniform(0.01, 0.06) if child else bt(1.5, 3.0)
+        self.repair_skill = r.uniform(0.01, 0.06) if child else bt(1.5, 3.0)
+        self.parenting_desire = (self.optimism + self.patience) / 2.0
+        self.education_level = (
+            0.0 if child else min(0.8, max(0.1, self.skill))
+        )
+        self.school_days = 0
+        self.adult_since_day = None if child else w.day
         self.cash = 0.0
         self.savings = 0.0
         self.hold = {}               # simbol -> [unit, harga rata-rata]
@@ -561,6 +611,11 @@ class Citizen:
         self.vehicle_value = 0.0
         self.vehicle_color = None
         self.thoughts = deque(maxlen=8)
+        self.memory = EpisodicMemory()
+        self.knowledge = KnowledgeGraph()
+        self.bdi = BDIState()
+        self.adaptive_learning = LearningState()
+        self.experiments = ExperimentState()
         self.look = (r.randrange(len(SKINS)), r.randrange(len(HAIRS)),
                      r.randrange(len(SHIRTS)), r.randrange(len(PANTS)))
         self.label = self._label()
@@ -617,9 +672,17 @@ class Citizen:
         business_assets = self.business.asset_value if self.business else 0.0
         vacant_land = sum(self.w.lot_price for lot in self.w.lots
                           if lot.land_owner is self and lot.building is None)
+        social_assets = sum(
+            organization["fund"]
+            * organization["members"].get(str(self.id), {}).get("share", 0.0)
+            for organization in getattr(self.w, "social_state", {}).get(
+                "organizations", {}
+            ).values()
+            if organization["status"] == "active"
+        )
         return (self.cash + self.savings + self.holdings_value
                 + sum(h.value for h in self.houses) + business_assets
-                + vacant_land + self.vehicle_value)
+                + vacant_land + self.vehicle_value + social_assets)
 
     @property
     def networth(self):
@@ -688,6 +751,35 @@ def _all_business_scope(world, *args, **kwargs):
     return world.businesses
 
 
+def _organization_business_scope(world, organization_id):
+    organization = ensure_social_state(world)["organizations"].get(
+        str(organization_id)
+    )
+    if organization is None:
+        return []
+    business_ids = {
+        member["business_id"]
+        for member in organization["members"].values()
+    }
+    return [
+        business for business in world.businesses
+        if business.ledger_id in business_ids
+    ]
+
+
+def _cooperation_business_scope(world, offer_id):
+    offer = ensure_social_state(world)["offers"].get(str(offer_id))
+    if offer is None:
+        return []
+    business_ids = {
+        offer["buyer_business_id"], offer["seller_business_id"],
+    }
+    return [
+        business for business in world.businesses
+        if business.ledger_id in business_ids
+    ]
+
+
 # ----------------------------------------------------------------------------- dunia
 class World:
     def __init__(self, seed=None, n_pop=60):
@@ -698,6 +790,8 @@ class World:
         # Dana awal berasal dari kas kota; cadangan bank adalah bagian dari dana tersebut.
         self.bank = Bank(300_000_000)
         self.treasury = 3_000_000_000.0
+        self.max_population = MAX_POP
+        self.days_per_year = DPY
         self.day, self.hour = 0, 7.0
         self.house_index = 1.0
         self.rent_yield = 0.065
@@ -723,6 +817,8 @@ class World:
         self.gig_count = 0
         self.trade_contracts = deque(maxlen=2_000)
         self.next_trade_id = 1
+        self.social_state = new_social_state()
+        self.family_state = new_family_state()
         self.import_supply_remaining = dict(DAILY_IMPORT_CAPACITY)
         self.rev_week = 0.0
         self.rev_ma = 0.0
@@ -745,7 +841,8 @@ class World:
         """Tambahkan state baru ke save lama tanpa menghapus progres pemain."""
         for attr, value in (("auto_policy", True), ("mayor_id", None),
                             ("next_election_day", self.day + DPY),
-                            ("government_learning", 0.02), ("last_random_event", self.day)):
+                            ("government_learning", 0.02), ("last_random_event", self.day),
+                            ("max_population", MAX_POP), ("days_per_year", DPY)):
             if not hasattr(self, attr):
                 setattr(self, attr, value)
         bank = self.bank
@@ -777,7 +874,30 @@ class World:
                                 ("last_gig", ""), ("crimes", 0)):
                 if not hasattr(citizen, attr):
                     setattr(citizen, attr, value)
+            if not hasattr(citizen, "memory"):
+                citizen.memory = EpisodicMemory()
+            if not hasattr(citizen, "knowledge"):
+                citizen.knowledge = KnowledgeGraph()
+            if not hasattr(citizen, "bdi"):
+                citizen.bdi = BDIState()
+            if not hasattr(citizen, "adaptive_learning"):
+                citizen.adaptive_learning = LearningState()
+            if not hasattr(citizen, "experiments"):
+                citizen.experiments = ExperimentState()
+            if not hasattr(citizen, "parenting_desire"):
+                citizen.parenting_desire = (
+                    getattr(citizen, "optimism", 0.5)
+                    + getattr(citizen, "patience", 0.5)
+                ) / 2.0
+            if not hasattr(citizen, "education_level"):
+                citizen.education_level = min(0.8, citizen.age / 60.0)
+            if not hasattr(citizen, "school_days"):
+                citizen.school_days = 0
+            if not hasattr(citizen, "adult_since_day"):
+                citizen.adult_since_day = self.day if citizen.age >= 18 else None
         for business in self.businesses:
+            if not hasattr(business, "innovation_price_multiplier"):
+                business.innovation_price_multiplier = 1.0
             if not hasattr(business, "land_value"):
                 business.land_value = self.lot_price
             if not hasattr(business, "equipment_value"):
@@ -818,6 +938,8 @@ class World:
             self.trade_contracts = deque(maxlen=2_000)
         elif not isinstance(self.trade_contracts, deque):
             self.trade_contracts = deque(self.trade_contracts, maxlen=2_000)
+        ensure_social_state(self)
+        ensure_family_state(self)
         if not hasattr(self, "next_trade_id"):
             self.next_trade_id = 1
         if not hasattr(self, "import_supply_remaining"):
@@ -879,6 +1001,10 @@ class World:
             balances[f"business:{business.ledger_id}:inventory"] = (
                 business.inventory_value, "debit"
             )
+        for organization in self.social_state["organizations"].values():
+            balances[
+                f"organization:{organization['id']}:cash"
+            ] = (organization.get("fund", 0.0), "debit")
         return balances
 
     def reconcile_ledger(self, tolerance=0.01):
@@ -954,7 +1080,325 @@ class World:
         }
         self.trade_contracts.append(contract)
         self.next_trade_id += 1
+        record_trade_interaction(self, buyer, seller, contract)
         return contract
+
+    @ledgered_transaction(
+        "cooperative_trade_settlement",
+        "counterpart:cooperative_trade",
+        business_selector=_cooperation_business_scope,
+    )
+    def _settle_cooperation_trade(self, offer_id):
+        state = ensure_social_state(self)
+        offer = state["offers"].get(str(offer_id))
+        if offer is None or offer["status"] != "pending":
+            return None
+        buyer = next(
+            (item for item in self.businesses
+             if item.ledger_id == offer["buyer_business_id"]),
+            None,
+        )
+        seller = next(
+            (item for item in self.businesses
+             if item.ledger_id == offer["seller_business_id"]),
+            None,
+        )
+        quantity = offer["quantity"]
+        unit_price = offer["unit_price"]
+        if (buyer is None or seller is None or buyer.kind != "shop"
+                or seller.kind not in ("farm", "factory")
+                or quantity <= 0 or unit_price <= 0
+                or quantity > seller.stock
+                or unit_price < seller.price * 0.8
+                or unit_price > seller.price * 1.2):
+            return None
+
+        organization = None
+        fee = 0.0
+        organization_id = offer["organization_id"]
+        if organization_id is not None:
+            organization = state["organizations"].get(str(organization_id))
+            if (organization is None or organization["status"] != "active"
+                    or str(offer["buyer_id"]) not in organization["members"]
+                    or str(offer["seller_id"]) not in organization["members"]):
+                return None
+            fee_rate = organization["rules"]["brokerage_fee_rate"]
+            fee = quantity * unit_price * fee_rate
+        goods_total = quantity * unit_price
+        if buyer.cash < goods_total + fee:
+            return None
+
+        buyer.cash -= goods_total + fee
+        buyer.exp += goods_total + fee
+        seller.cash += goods_total
+        seller.rev += goods_total
+        seller.stock -= quantity
+        seller.demand_today += quantity
+        seller.sold_today += quantity
+        new_stock = buyer.stock + quantity
+        buyer.cost_avg = (
+            buyer.stock * buyer.cost_avg + goods_total
+        ) / new_stock
+        buyer.stock = new_stock
+        contract = self._record_trade_contract(
+            buyer, seller, seller.market_product, quantity, unit_price
+        )
+        if organization is not None:
+            organization["fund"] += fee
+            organization["undistributed_profit"] += fee
+            organization["trade_count"] = organization.get("trade_count", 0) + 1
+            organization["reputation"] = min(
+                1.0, organization["reputation"] + 0.001
+            )
+            contract["organization_id"] = organization["id"]
+            contract["cooperation_fee"] = fee
+        return contract
+
+    @ledgered_transaction(
+        "organization_formation",
+        "counterpart:organization_contributions",
+        business_selector=_organization_business_scope,
+    )
+    def activate_social_organization(self, organization_id):
+        organization = ensure_social_state(self)["organizations"].get(
+            str(organization_id)
+        )
+        if (organization is None or organization["status"] != "pending"
+                or not all(
+                    member["accepted"]
+                    for member in organization["members"].values()
+                )):
+            return False
+        contributions = []
+        for member_id, member in organization["members"].items():
+            business = next(
+                (item for item in self.businesses
+                 if item.ledger_id == member["business_id"]),
+                None,
+            )
+            contribution = member["contribution"]
+            if (business is None or not math.isfinite(contribution)
+                    or contribution <= 0 or business.cash < contribution):
+                return False
+            contributions.append((member_id, member, business, contribution))
+        total = sum(item[3] for item in contributions)
+        if not math.isfinite(total) or total <= 0:
+            return False
+        for _, member, business, contribution in contributions:
+            business.cash -= contribution
+            member["share"] = contribution / total
+        organization["fund"] = total
+        organization["contributed_capital"] = total
+        organization["status"] = "active"
+        organization["activated_day"] = self.day
+        self.log(
+            "info", f"{organization['name'].upper()} TERBENTUK",
+            f"{len(contributions)} usaha menyetor {rp(total)}",
+        )
+        return True
+
+    @ledgered_transaction(
+        "organization_monthly_settlement",
+        "counterpart:organization_operations",
+        include_all=True,
+    )
+    def settle_social_organizations(self):
+        for organization in ensure_social_state(self)["organizations"].values():
+            if organization["status"] != "active":
+                continue
+            members = organization["members"]
+            rules = organization["rules"]
+            maintenance = (
+                rules["monthly_maintenance_per_member"] * len(members)
+            )
+            if organization["fund"] >= maintenance:
+                organization["fund"] -= maintenance
+                organization["maintenance_failures"] = 0
+                organization["reputation"] = min(
+                    1.0, organization["reputation"] + 0.005
+                )
+            else:
+                organization["maintenance_failures"] += 1
+                organization["reputation"] = max(
+                    0.0, organization["reputation"] - 0.05
+                )
+                if organization["maintenance_failures"] >= 2:
+                    self._dissolve_social_organization(organization)
+                    continue
+
+            reserve = max(
+                maintenance * rules["reserve_months"],
+                organization["contributed_capital"] * 0.5,
+            )
+            distributable = min(
+                organization["undistributed_profit"],
+                max(0.0, organization["fund"] - reserve),
+            )
+            distribution = distributable * rules["profit_share_rate"]
+            if distribution > 0:
+                for member_id, member in members.items():
+                    payout = distribution * member["share"]
+                    business = next(
+                        (item for item in self.businesses
+                         if item.ledger_id == member["business_id"]),
+                        None,
+                    )
+                    citizen = next(
+                        (item for item in self.citizens
+                         if str(item.id) == member_id),
+                        None,
+                    )
+                    if business is not None:
+                        business.cash += payout
+                        business.rev += payout
+                    elif citizen is not None:
+                        citizen.cash += payout
+                organization["fund"] -= distribution
+                organization["undistributed_profit"] -= distribution
+            organization["last_settlement_day"] = self.day
+        return True
+
+    def _dissolve_social_organization(self, organization):
+        fund = organization["fund"]
+        members = list(organization["members"].items())
+        remaining_fund = fund
+        for index, (member_id, member) in enumerate(members):
+            payout = (
+                remaining_fund if index == len(members) - 1
+                else fund * member["share"]
+            )
+            business = next(
+                (item for item in self.businesses
+                 if item.ledger_id == member["business_id"]),
+                None,
+            )
+            citizen = next(
+                (item for item in self.citizens
+                 if str(item.id) == member_id),
+                None,
+            )
+            if business is not None:
+                business.cash += payout
+            elif citizen is not None:
+                citizen.cash += payout
+            member["share"] = 0.0
+            remaining_fund -= payout
+        if remaining_fund > 0 and not members:
+            founder = next(
+                (item for item in self.citizens
+                 if item.id == organization["founder_id"]),
+                None,
+            )
+            if founder is not None:
+                founder.cash += remaining_fund
+        organization["fund"] = 0.0
+        organization["undistributed_profit"] = 0.0
+        organization["status"] = "dissolved"
+        organization["dissolved_day"] = self.day
+        self.log(
+            "bad", f"{organization['name'].upper()} DIBUBARKAN",
+            "Dana dikembalikan sesuai porsi anggota.",
+        )
+
+    @ledgered_transaction(
+        "organization_member_exit",
+        "counterpart:organization_exit",
+        include_all=True,
+    )
+    def leave_social_organization(self, citizen, organization_id):
+        if citizen not in self.citizens:
+            raise ValueError("Anggota organisasi tidak ditemukan.")
+        organization = ensure_social_state(self)["organizations"].get(
+            str(organization_id)
+        )
+        member_id = str(citizen.id)
+        if (organization is None or organization["status"] != "active"
+                or member_id not in organization["members"]):
+            return False
+        member = organization["members"].pop(member_id)
+        payout = organization["fund"] * member["share"]
+        business = next(
+            (item for item in self.businesses
+             if item.ledger_id == member["business_id"]),
+            None,
+        )
+        if business is not None:
+            business.cash += payout
+        else:
+            citizen.cash += payout
+        organization["fund"] -= payout
+        organization["undistributed_profit"] *= max(
+            0.0, 1.0 - member["share"]
+        )
+        remaining_share = sum(
+            item["share"] for item in organization["members"].values()
+        )
+        if len(organization["members"]) < 2:
+            for remaining in organization["members"].values():
+                remaining["share"] = 1.0
+            self._dissolve_social_organization(organization)
+        elif remaining_share > 0:
+            for remaining in organization["members"].values():
+                remaining["share"] /= remaining_share
+        return payout
+
+    def social_relationship(self, source, target):
+        return relationship(self, source, target)
+
+    def social_reputation(self, citizen):
+        return reputation(self, citizen)
+
+    def record_social_interaction(
+            self, actor, other, kind, success=None, outcome=""):
+        return record_interaction(
+            self, actor, other, kind, success, outcome
+        )
+
+    def end_social_relationship(self, actor, other):
+        return end_relationship(self, actor, other)
+
+    def observe_social_action(
+            self, observer, actor, action, values, context=None):
+        return observe_action(
+            self, observer, actor, action, values, context
+        )
+
+    def share_social_knowledge(self, sender, receiver, observation_id):
+        return share_knowledge(self, sender, receiver, observation_id)
+
+    def propose_cooperative_trade(
+            self, buyer, seller, quantity, unit_price, organization_id=None):
+        return propose_trade_cooperation(
+            self, buyer, seller, quantity, unit_price, organization_id
+        )
+
+    def respond_cooperative_trade(
+            self, citizen, offer_id, decision, quantity=None, unit_price=None):
+        return respond_trade_offer(
+            self, citizen, offer_id, decision, quantity, unit_price
+        )
+
+    def propose_social_organization(
+            self, founder, invitees, name, contribution):
+        return propose_organization(
+            self, founder, invitees, name, contribution
+        )
+
+    def respond_social_invitation(self, citizen, organization_id, accept):
+        return respond_organization_invitation(
+            self, citizen, organization_id, accept
+        )
+
+    def propose_organization_rule(self, citizen, organization_id, rule, value):
+        return propose_organization_rule(
+            self, citizen, organization_id, rule, value
+        )
+
+    def vote_organization_rule(
+            self, citizen, organization_id, proposal_id, approve):
+        return vote_organization_rule(
+            self, citizen, organization_id, proposal_id, approve
+        )
 
     @ledgered_transaction("production_input_purchase",
                           "counterpart:external_input_supplier",
@@ -1026,15 +1470,129 @@ class World:
         return self.day // DPY + 1
 
     # ---- warga masuk / keluar
-    def add_citizen(self, young=False):
-        c = Citizen(self, self.next_id, young)
+    def add_citizen(self, young=False, child=False):
+        c = Citizen(self, self.next_id, young, child)
         self.next_id += 1
         self.citizens.append(c)
         return c
 
+    @ledgered_transaction(
+        "birth_settlement",
+        "counterpart:birth_medical_services",
+        include_all=True,
+        track_world_collections=True,
+    )
+    def birth_child(self, parent_a, parent_b):
+        if (parent_a not in self.citizens or parent_b not in self.citizens
+                or parent_a is parent_b or not is_adult(parent_a)
+                or not is_adult(parent_b)
+                or active_partner(self, parent_a) is not parent_b):
+            return None
+        birthing_parent = next(
+            (
+                parent for parent in (parent_a, parent_b)
+                if parent.female and 20.0 <= parent.age <= 40.0
+            ),
+            None,
+        )
+        if (birthing_parent is None or parent_a.home is None
+                or parent_a.home is not parent_b.home
+                or parent_a.home.free <= 0):
+            return None
+        dependent_ids = {
+            child.id for child in children_of(self, parent_a)
+            if child.age < 18.0
+        }
+        if (len(dependent_ids) >= 2 or len(self.citizens) >= self.max_population
+                or parent_a.health < 50.0 or parent_b.health < 50.0
+                or min(parent_a.happy, parent_b.happy) < 40.0):
+            return None
+        birth_cost = 250_000.0
+        if parent_a.cash + parent_a.savings + parent_b.cash + parent_b.savings < birth_cost:
+            return None
+        remaining_cost = birth_cost
+        for parent in sorted(
+                (parent_a, parent_b),
+                key=lambda item: item.cash + item.savings,
+                reverse=True):
+            contribution = min(
+                remaining_cost, parent.cash + parent.savings
+            )
+            if contribution and not self.pay_from(parent, contribution):
+                raise RuntimeError("Biaya kelahiran berubah saat penyelesaian.")
+            parent.exp_acc += contribution
+            remaining_cost -= contribution
+        if remaining_cost > 0.01:
+            raise RuntimeError("Biaya kelahiran tidak terbayar penuh.")
+
+        child = self.add_citizen(child=True)
+        child.skill = min(
+            0.2,
+            (parent_a.skill + parent_b.skill) * 0.1
+            + self.rng.uniform(0.01, 0.08),
+        )
+        child.learning = 0.02
+        self.move_in(child, parent_a.home)
+        register_birth(self, (parent_a, parent_b), child)
+        self.log(
+            "good", f"{child.first.upper()} LAHIR",
+            f"Anak dari {parent_a.first} dan {parent_b.first}",
+        )
+        return child
+
+    def propose_partnership(self, proposer, recipient):
+        return propose_partnership(self, proposer, recipient)
+
+    def respond_partnership(self, recipient, proposal_id, accept):
+        return respond_partnership(self, recipient, proposal_id, accept)
+
+    def family_partner(self, citizen):
+        return active_partner(self, citizen)
+
+    def family_parents(self, child):
+        return parents_of(self, child)
+
+    def family_children(self, parent):
+        return children_of(self, parent)
+
+    def family_siblings(self, citizen):
+        return siblings_of(self, citizen)
+
+    def family_guardians(self, child):
+        return guardians_of(self, child)
+
+    def appoint_family_guardian(self, child, guardian):
+        return appoint_guardian(self, child, guardian)
+
+    def teach_family_knowledge(
+            self, teacher, child, observation_id, method="teaching"):
+        return teach_knowledge(
+            self, teacher, child, observation_id, method
+        )
+
     @ledgered_transaction("estate_settlement", "counterpart:estate_settlement",
                           include_all=True, track_world_collections=True)
     def remove_citizen(self, c, inherit=True, cause="meninggal"):
+        if (c not in self.citizens
+                or not is_adult(c) and cause == "pindah"):
+            return False
+        heirs = family_heirs(self, c) if inherit else []
+        heir = heirs[0] if heirs else None
+        if cause == "pindah":
+            handle_departure(self, c)
+        else:
+            handle_death(self, c)
+        for organization in list(
+                ensure_social_state(self)["organizations"].values()):
+            if str(c.id) in organization["members"]:
+                if organization["status"] == "active":
+                    self.leave_social_organization(c, organization["id"])
+                elif organization["status"] == "pending":
+                    organization["status"] = "cancelled"
+        for offer in ensure_social_state(self)["offers"].values():
+            if (offer["status"] == "pending"
+                    and c.id in (offer["sender_id"], offer["recipient_id"])):
+                offer["status"] = "cancelled"
         c.dead = True
         if c.home:
             c.home.occupants.remove(c)
@@ -1043,8 +1601,6 @@ class World:
             c.job.workers.remove(c)
             c.job = None
         self.citizens.remove(c)
-        heirs = [x for x in self.citizens if x.age >= 18]
-        heir = self.rng.choice(heirs) if (heirs and inherit) else None
         if heir:
             for loan in list(c.loans):
                 c.loans.remove(loan)
@@ -1089,6 +1645,7 @@ class World:
                 self.close_business(c.business, quiet=True)
         if cause != "pindah":
             self.log("info", f"{c.first.upper()} {cause.upper()}", f"Umur {int(c.age)}")
+        return True
 
     # ---- bank
     @ledgered_transaction("deposit", "counterpart:deposit_accrual")
@@ -1152,7 +1709,8 @@ class World:
 
     def credit_ok(self, c, amount, months, kind, rate):
         b = self.bank
-        if (c not in self.citizens or not math.isfinite(amount) or amount <= 0
+        if (c not in self.citizens or not is_adult(c)
+                or not math.isfinite(amount) or amount <= 0
                 or not math.isfinite(rate) or rate < 0
                 or not math.isfinite(months) or months <= 0):
             return False
@@ -1183,7 +1741,7 @@ class World:
 
     def apply_personal_loan(self, c, amount, months=12):
         """Ajukan pinjaman tanpa agunan dengan plafon berbasis karakter dan riwayat kredit."""
-        if c not in self.citizens:
+        if c not in self.citizens or not is_adult(c):
             return None
         amount = float(amount)
         if not self.credit_ok(c, amount, months, "personal", self.policy.loan_rate):
@@ -1193,7 +1751,8 @@ class World:
     @ledgered_transaction("loan_disbursement", "counterpart:loan_settlement",
                           track_world_collections=True)
     def make_loan(self, c, amount, rate, months, kind, ref=None):
-        if (c not in self.citizens or not math.isfinite(amount) or amount <= 0
+        if (c not in self.citizens or not is_adult(c)
+                or not math.isfinite(amount) or amount <= 0
                 or not math.isfinite(rate) or rate < 0
                 or not math.isfinite(months) or months <= 0
                 or self.bank.cash < amount):
@@ -1281,7 +1840,7 @@ class World:
     def found_business(self, c, kind, force=False):
         lots = [l for l in self.lots if l.kind == "biz" and l.building is None
                 and l.land_owner is None]
-        if not lots or c.business or kind not in STARTUP:
+        if not is_adult(c) or not lots or c.business or kind not in STARTUP:
             return False
         p = self.policy
         cost = self.lot_price + STARTUP[kind]
@@ -1335,7 +1894,7 @@ class World:
     @ledgered_transaction("land_purchase", "counterpart:land_transfer")
     def buy_land(self, c, lot=None):
         """Beli lahan kosong dari pemerintah; biaya lahan masuk ke kas pemerintah."""
-        if c not in self.citizens:
+        if c not in self.citizens or not is_adult(c):
             return None
         available = [item for item in self.lots if item.kind == "biz"
                      and item.building is None and item.land_owner is None]
@@ -1355,7 +1914,7 @@ class World:
                           include_businesses=True, track_world_collections=True)
     def build_house(self, c, lot=None):
         """Bangun rumah di lahan milik warga lewat perusahaan kontraktor."""
-        if c not in self.citizens:
+        if c not in self.citizens or not is_adult(c):
             return None
         owned = [item for item in self.lots if item.land_owner is c
                  and item.building is None and item.kind == "biz"]
@@ -1471,7 +2030,9 @@ class World:
                           track_world_collections=True)
     def buy_house(self, c, house):
         """Beli rumah dari pemilik saat ini atau pemerintah dengan uang tunai/KPR."""
-        if c not in self.citizens or house not in self.houses or house.bank_owned or house.owner is c:
+        if (c not in self.citizens or not is_adult(c)
+                or house not in self.houses or house.bank_owned
+                or house.owner is c):
             return False
         price = house.value
         fee = price * 0.01
@@ -1583,6 +2144,8 @@ class World:
     def buy_asset(self, c, sym, amount):
         if c not in self.citizens:
             raise ValueError("Warga pembeli tidak ditemukan.")
+        if not is_adult(c):
+            raise ValueError("Warga harus dewasa untuk membeli aset.")
         if sym not in self.market.assets:
             raise ValueError(f"Aset {sym!r} tidak ditemukan.")
         try:
@@ -1632,11 +2195,17 @@ class World:
         c.hold[sym] = [next_units, next_average_price]
         a.flow = next_flow
         a.traded = next_traded
+        c.memory.record(
+            self.day, "investment", "purchase", {"asset": sym},
+            "position opened", None, impact=0.1,
+        )
         return amount
 
     def sell_asset(self, c, sym, frac=1.0):
         if c not in self.citizens:
             raise ValueError("Warga penjual tidak ditemukan.")
+        if not is_adult(c):
+            raise ValueError("Warga harus dewasa untuk menjual aset.")
         if sym not in self.market.assets:
             raise ValueError(f"Aset {sym!r} tidak ditemukan.")
         try:
@@ -1666,6 +2235,11 @@ class World:
                 or not math.isfinite(c.cash) or not math.isfinite(self.treasury)
                 or not math.isfinite(a.flow) or not math.isfinite(a.traded)):
             raise ValueError("Saldo atau data aset tidak valid untuk penjualan.")
+        momentum = a.momentum() * 4 + a.change(10) * 2
+        volatility = a.vol
+        if not math.isfinite(momentum) or not math.isfinite(volatility):
+            raise ValueError("Data pasar tidak valid untuk pengalaman investasi.")
+        momentum = max(-1.0, min(1.0, momentum))
         units = min(owned_units, owned_units * fraction)
         if units <= 0:
             return 0.0
@@ -1699,6 +2273,24 @@ class World:
             c.hold[sym] = [remaining_units, average_price]
         a.flow = next_flow
         a.traded = next_traded
+        realized_return = price * (1 - tax_rate) / average_price - 1
+        value = max(-1.0, min(1.0, realized_return))
+        episode = c.memory.record(
+            self.day, "investment", "sale", {"asset": sym},
+            f"realized return {value:+.1%}", value > 0,
+            impact=min(1.0, abs(value)), value=value,
+        )
+        c.knowledge.observe(
+            self.day,
+            "personal_experience",
+            f"investment-sale:{episode.source_ids[-1]}",
+            {
+                "market_momentum": momentum,
+                "market_volatility": volatility,
+                "realized_return": value,
+            },
+            context={"asset": sym},
+        )
         return gross
 
     def perceive(self, c, a):
@@ -1706,10 +2298,36 @@ class World:
         mom = max(-1.0, min(1.0, a.momentum() * 4 + a.change(10) * 2))
         noise = 0.12 * (1.0 - c.financial_literacy) + 0.015
         est = (1 - c.herd) * prior + c.herd * mom + (c.optimism - 0.5) * 0.25 + self.rng.gauss(0, noise)
-        return est - 0.5 * (1 - c.risk) * a.vol
+        estimate = est - 0.5 * (1 - c.risk) * a.vol
+        experience = c.memory.retrieve(
+            domain="investment",
+            action="sale",
+            context={"asset": a.sym},
+            current_day=self.day,
+            limit=8,
+        )
+        if experience:
+            observation_count = sum(item.source_count for item in experience)
+            average_return = sum(
+                item.mean_value * item.source_count for item in experience
+            ) / observation_count
+            confidence = min(1.0, observation_count / 3.0)
+            estimate += max(
+                -0.04, min(0.04, average_return * 0.08)
+            ) * confidence
+        estimate += c.knowledge.prediction_adjustment(
+            "market_momentum",
+            "realized_return",
+            mom,
+            context={"asset": a.sym},
+            current_day=self.day,
+        )
+        return estimate
 
     def finance(self, c):
         """Keputusan keuangan mingguan: nabung, jual, atau beli aset."""
+        if not is_adult(c):
+            return
         r = self.rng
         p = self.policy
         est = max(c.est_exp, 1_500_000)
@@ -1767,7 +2385,8 @@ class World:
 
     def maybe_start_business(self, c):
         r = self.rng
-        if c.business or c.age >= RETIRE_AGE or c.entre < 0.3:
+        if (not is_adult(c) or c.business or c.age >= RETIRE_AGE
+                or c.entre < 0.3):
             return
         lot_count = sum(
             lot.kind == "biz" and lot.building is None and lot.land_owner is None
@@ -1885,7 +2504,8 @@ class World:
     @ledgered_transaction("vehicle_purchase", "counterpart:vehicle_financing",
                           include_businesses=True)
     def buy_car(self, c):
-        if c.vehicle_value or not c.home or not (c.job or c.business):
+        if (not is_adult(c) or c.vehicle_value or not c.home
+                or not (c.job or c.business)):
             return False
         dealers = [
             business for business in self.businesses
@@ -1924,13 +2544,14 @@ class World:
         return True
 
     def maybe_buy_car(self, c):
-        if c.vehicle_value or not c.home or not (c.job or c.business) or self.rng.random() > 0.01:
+        if (not is_adult(c) or c.vehicle_value or not c.home
+                or not (c.job or c.business) or self.rng.random() > 0.01):
             return
         self.buy_car(c)
 
     def maybe_buy_house(self, c):
         r = self.rng
-        if c.age >= 65 or r.random() > 0.15:
+        if not is_adult(c) or c.age >= 65 or r.random() > 0.15:
             return
         if any(lot.land_owner is c and lot.building is None for lot in self.lots):
             return
@@ -1945,7 +2566,8 @@ class World:
         self.buy_house(c, h)
 
     def maybe_buy_land(self, c):
-        if (c.age >= 60 or c.houses or any(lot.land_owner is c for lot in self.lots)
+        if (not is_adult(c) or c.age >= 60 or c.houses
+                or any(lot.land_owner is c for lot in self.lots)
                 or (c.home is not None and c.home.owner is c)):
             return
         reserve = max(3 * c.est_exp, 5_000_000)
@@ -1956,6 +2578,8 @@ class World:
         self.buy_land(c)
 
     def maybe_build_house(self, c):
+        if not is_adult(c):
+            return
         owned = [lot for lot in self.lots if lot.land_owner is c and lot.building is None]
         if not owned or c.cash + c.savings < BUILD_COST + max(c.est_exp, 2_000_000):
             return
@@ -1986,33 +2610,144 @@ class World:
     # ---- pasar kerja
     def job_market(self):
         r = self.rng
-        p = self.policy
         emps = [e for e in self.workplaces() if e.vacancies > 0 and e.can_hire()]
         if not emps:
             return
-        seekers = [c for c in self.citizens
-                   if c.age < RETIRE_AGE and c.business is None and (c.job is None or r.random() < 0.03)]
+        seekers = [
+            c for c in self.citizens
+            if is_adult(c) and c.age < RETIRE_AGE and c.business is None
+            and (c.job is None or r.random() < 0.03)
+        ]
         r.shuffle(seekers)
         for c in seekers:
             emps = [e for e in emps if e.vacancies > 0]
             if not emps:
                 break
-            best = max(emps, key=lambda e: e.pay_for(c))
-            w = best.pay_for(c)
-            if c.job is None:
-                reserve = p.min_wage * (0.9 + 0.5 * c.greed) * (0.985 ** c.unemp_days)
-                if w < reserve:
-                    continue
-            else:
-                if w <= c.job.pay_for(c) * 1.12 or not best.can_hire():
-                    continue
-                c.job.workers.remove(c)
-            best.workers.append(c)
-            c.job = best
-            c.unemp_days = 0
-            c.missed_pay = 0
-            c.think(f"Diterima kerja di {best.name}, gaji {rp(w)}/bln.")
-            c.learn(0.0015)
+            self._match_job(c, emps)
+
+    def _match_job(self, c, employers):
+        if not is_adult(c) or not employers:
+            return False
+        best = max(employers, key=lambda employer: employer.pay_for(c))
+        wage = best.pay_for(c)
+        if c.job is None:
+            reserve = (
+                self.policy.min_wage * (0.9 + 0.5 * c.greed)
+                * (0.985 ** c.unemp_days)
+            )
+            if wage < reserve:
+                return False
+        else:
+            if wage <= c.job.pay_for(c) * 1.12 or not best.can_hire():
+                return False
+            c.job.workers.remove(c)
+        best.workers.append(c)
+        c.job = best
+        c.unemp_days = 0
+        c.missed_pay = 0
+        c.think(f"Diterima kerja di {best.name}, gaji {rp(wage)}/bln.")
+        c.learn(0.0015)
+        return True
+
+    def try_seek_job(self, c):
+        if (c not in self.citizens or not is_adult(c)
+                or c.age >= RETIRE_AGE
+                or c.business is not None):
+            return False
+        employers = [
+            employer for employer in self.workplaces()
+            if employer.vacancies > 0 and employer.can_hire()
+        ]
+        return self._match_job(c, employers)
+
+    def agent_decision_cycle(self, c):
+        """Update one citizen's BDI state and execute at most one validated step."""
+        if c not in self.citizens or not is_adult(c):
+            return False
+        if not hasattr(c, "bdi"):
+            c.bdi = BDIState()
+        if not hasattr(c, "adaptive_learning"):
+            c.adaptive_learning = LearningState()
+        state = c.bdi
+        learning = c.adaptive_learning
+        if learning.last_decision_day == self.day:
+            return False
+        settle_pending(learning, self, c)
+        learning.last_decision_day = self.day
+        update_beliefs(self, c, state)
+        goals = form_goals(self, c, state)
+        current_state = planning_state(self, c)
+        actions = available_actions(self, c, current_state)
+        context = learning_context(c)
+        candidates = []
+        for goal in goals:
+            plan = AGENT_PLANNER.plan(current_state, goal, actions)
+            if plan is not None and plan.actions:
+                base_score = (
+                    goal.priority * goal.expected_benefit / (1.0 + plan.cost)
+                )
+                arm = f"{goal.id}|{plan.actions[0].token}"
+                score = learning.score(context, arm, base_score)
+                candidates.append(
+                    (score, goal.priority, goal.id, goal, plan, context, arm)
+                )
+        if not candidates:
+            if (state.intention is not None
+                    and state.intention.status == "active"):
+                state.intention.status = "cancelled"
+            state.intention = None
+            if consider_social_action(self, c):
+                return True
+            if consider_family_action(self, c):
+                return True
+            if consider_teaching(self, c):
+                return True
+            if consider_organization(self, c):
+                return True
+            return consider_price_experiment(
+                self,
+                c,
+                state.motivations.get("learning", 0.0),
+                state.motivations,
+            )
+
+        _, _, _, goal, plan, context, arm = max(
+            candidates, key=lambda item: (item[0], item[1], item[2])
+        )
+        action_ids = tuple(action.token for action in plan.actions)
+        previous = state.intention
+        if (previous is not None and previous.goal_id == goal.id
+                and previous.status == "active"
+                and previous.action_ids[previous.next_step:] == action_ids):
+            intention = Intention(
+                goal.id, previous.action_ids, previous.planned_day,
+                previous.next_step, previous.last_action_day,
+            )
+        else:
+            if previous is not None and previous.status == "active":
+                previous.status = "cancelled"
+            intention = Intention(goal.id, action_ids, self.day)
+        before = outcome_snapshot(self, c)
+        social_need = 1.0 / (1.0 + social_contact_count(c))
+        weights = objective_weights(state.motivations, social_need)
+        if not execute_action(self, c, plan.actions[0]):
+            learning.update(context, arm, -0.25, self.day)
+            intention.status = "cancelled"
+            state.intention = None
+            return False
+        learning.remember(context, arm, before, weights, self.day)
+        intention.next_step += 1
+        intention.last_action_day = self.day
+        if intention.next_step >= len(intention.action_ids):
+            intention.status = "completed"
+        state.intention = intention
+        return True
+
+    def share_experiment_result(self, sender, receiver, experiment_id):
+        """Explicitly share one completed experiment with one other citizen."""
+        return _share_experiment_result(
+            self, sender, receiver, experiment_id
+        )
 
     # ---- konsumsi
     @ledgered_transaction("consumer_purchase", "counterpart:consumer_settlement",
@@ -2057,10 +2792,17 @@ class World:
             requested = min(remaining, afford)
             seller.demand_today += requested
             q = min(requested, seller.stock)
-            if q <= 1e-6:
-                continue
+            available_for_purchase = available_funds - spent
             net = q * seller.price
             tax = net * p.tax_ppn
+            cost = net + tax
+            if q > 0 and cost > available_for_purchase:
+                q *= max(0.0, available_for_purchase / cost - 1e-14)
+                net = q * seller.price
+                tax = net * p.tax_ppn
+                cost = net + tax
+            if q <= 1e-6:
+                continue
             seller.stock -= q
             seller.cash += net
             seller.rev += net
@@ -2070,7 +2812,7 @@ class World:
                 c, seller, seller.market_product, q, seller.price, seller.quality,
                 tax,
             )
-            spent += net + tax
+            spent += cost
             got += q
             remaining -= q
         if spent and not self.pay_from(c, spent):
@@ -2081,12 +2823,12 @@ class World:
     def citizen_daily(self, c):
         r = self.rng
         p = self.policy
-        c.age += 1 / DPY
+        advance_age(self, c)
         px = self.avg_price()
         lux_cash = max(0.0, c.cash - c.est_exp * (0.2 + 0.5 * c.frugal))
         spend = lux_cash * 0.06 * (1 - 0.6 * c.frugal)
         want = 1.0 + (spend / (px * (1 + p.tax_ppn)) if px > 0 else 0.0)
-        got = self.buy_goods(c, want)
+        got = self.buy_goods(food_payer(self, c), want)
         if got < 0.99 and self.treasury >= 25_000:
             got += self.purchase_emergency_ration(c, 1.0 - got)
         if got < 0.99:
@@ -2123,7 +2865,8 @@ class World:
                                     + depression_pressure * 0.01 - recovery))
         if c.depression > 0.55 and self.day % 7 == c.id % 7:
             c.think("Merasa murung berkepanjangan; butuh dukungan dan keadaan yang lebih baik.")
-        if c.job is None and c.business is None and c.age < RETIRE_AGE:
+        if (is_adult(c) and c.job is None and c.business is None
+                and c.age < RETIRE_AGE):
             c.unemp_days += 1
         if c.age >= RETIRE_AGE and c.job:
             c.job.workers.remove(c)
@@ -2131,7 +2874,7 @@ class World:
             c.think("Pensiun dari pekerjaan.")
         if c.health <= 0:
             self.remove_citizen(c, cause="meninggal kelaparan")
-        elif c.age > 65 and r.random() < ((c.age - 65) * 0.015 + 0.005) / DPY:
+        elif r.random() < daily_mortality_probability(self, c):
             self.remove_citizen(c, cause="meninggal")
         elif c.unemp_days > 150 and c.cash + c.savings < 200_000 and r.random() < 0.004:
             self.log("info", f"{c.first.upper()} PINDAH KOTA", "Menganggur terlalu lama")
@@ -2349,6 +3092,10 @@ class World:
                 elif high:
                     b.markup = max(b.markup * 0.985, 0.08)
                 b.price = max(b.cost_avg * (1 + b.markup), 1000.0)
+                b.price = max(
+                    1000.0,
+                    b.price * b.innovation_price_multiplier,
+                )
             else:
                 pressure = max(-1.0, min(1.0, (unmet - (sellable_stock - target_stock))
                                           / max(target_stock, 1.0)))
@@ -2576,6 +3323,7 @@ class World:
             c.vehicle_value *= 0.985
         occ = sum(len(h.occupants) for h in self.houses) / max(1, sum(h.cap for h in self.houses))
         self.house_index *= 1 + (0.003 if occ > 0.9 else (-0.001 if occ < 0.6 else 0.0005))
+        self.settle_social_organizations()
     @ledgered_transaction("migration_entry", "counterpart:migration_settlement",
                           track_world_collections=True)
     def migration_daily(self):
@@ -2784,6 +3532,7 @@ class World:
     def daily(self):
         d = self.day
         r = self.rng
+        begin_experiment_day(self)
         self.market.step(self.employment_rate() - 0.7)
         if d % 7 == 0:
             self.weekly_start()
@@ -2803,6 +3552,7 @@ class World:
                 self.citizen_daily(c)
         self.gig_market()
         self.crime_daily()
+        capture_experiment_market(self)
         self.adjust_prices(targets)
         if d % 7 == 6:
             self.payroll()
@@ -2811,13 +3561,16 @@ class World:
                 self.weekly_business(b)
         self.housing_market()
         for c in list(self.citizens):
-            if c.id % 7 == d % 7:
+            if c.id % 7 == d % 7 and is_adult(c):
                 self.finance(c)
                 self.maybe_start_business(c)
                 self.maybe_build_house(c)
                 self.maybe_buy_land(c)
                 self.maybe_buy_house(c)
                 self.maybe_buy_car(c)
+                self.agent_decision_cycle(c)
+        if d % 7 == 0:
+            consider_births(self)
         self.migration_daily()
         self.random_event()
         self.government_cycle()
@@ -2829,6 +3582,7 @@ class World:
         self.sales_today = 0.0
         if d % 5 == 0:
             self.record()
+        finish_experiment_day(self)
 
     # ---- statistik
     def record(self):
