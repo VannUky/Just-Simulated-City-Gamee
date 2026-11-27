@@ -240,6 +240,8 @@ class House:
         self.condition = 1.0
         self.bank_owned = False
         self.bank_value = 0.0
+        self.last_sale_day = -360
+        self.construction_until = -1
 
     @property
     def value(self):
@@ -862,6 +864,10 @@ class World:
                 house.bank_owned = False
             if not hasattr(house, "bank_value"):
                 house.bank_value = 0.0
+            if not hasattr(house, "last_sale_day"):
+                house.last_sale_day = -360
+            if not hasattr(house, "construction_until"):
+                house.construction_until = -1
         for lot in self.lots:
             if not hasattr(lot, "land_owner"):
                 lot.land_owner = None
@@ -1002,10 +1008,11 @@ class World:
             balances[f"business:{business.ledger_id}:inventory"] = (
                 business.inventory_value, "debit"
             )
-        for organization in self.social_state["organizations"].values():
-            balances[
-                f"organization:{organization['id']}:cash"
-            ] = (organization.get("fund", 0.0), "debit")
+        if business_ids is None or business_ids:
+            for organization in self.social_state["organizations"].values():
+                balances[
+                    f"organization:{organization['id']}:cash"
+                ] = (organization.get("fund", 0.0), "debit")
         return balances
 
     def reconcile_ledger(self, tolerance=0.01):
@@ -1933,6 +1940,7 @@ class World:
         home = House(self, lot)
         home.base_structure_value = contract_price
         home.owner = c
+        home.construction_until = self.day + 5
         lot.kind = "house"
         lot.building = home
         lot.land_owner = None
@@ -2033,7 +2041,10 @@ class World:
         """Beli rumah dari pemilik saat ini atau pemerintah dengan uang tunai/KPR."""
         if (c not in self.citizens or not is_adult(c)
                 or house not in self.houses or house.bank_owned
-                or house.owner is c):
+                or house.owner is c
+                or getattr(house, "construction_until", -1) > self.day
+                or (house.owner is not None
+                    and self.day - getattr(house, "last_sale_day", -360) < 30)):
             return False
         price = house.value
         fee = price * 0.01
@@ -2076,6 +2087,7 @@ class World:
             self.gov_in(price)
         self.gov_in(fee)
         house.owner = c
+        house.last_sale_day = self.day
         c.houses.append(house)
         if mortgage:
             mortgage.ref = house
@@ -2556,7 +2568,14 @@ class World:
             return
         if any(lot.land_owner is c and lot.building is None for lot in self.lots):
             return
-        stock = [h for h in self.houses if h.owner is not c and not h.bank_owned]
+        stock = [
+            h for h in self.houses
+            if h.owner is not c
+            and not h.bank_owned
+            and getattr(h, "construction_until", -1) <= self.day
+            and (h.owner is None
+                 or self.day - getattr(h, "last_sale_day", -360) >= 30)
+        ]
         if not stock:
             return
         renter = c.home is None or c.home.owner is not c

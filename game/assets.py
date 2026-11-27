@@ -157,6 +157,7 @@ class Assets:
         self.char = self._load_characters()
         self.building_src = self._load_buildings()
         self.car_src = self._load_cars()
+        self.pack_buildings, self.pack_vehicles = self._load_pack3_assets()
         self.blank_btn = self._make_blank_buttons()
         self.blank_dock = self._make_blank_dock()
         self.dock = dict((k[5:], v) for k, v in self.menu.items() if k.startswith("dock_"))
@@ -243,6 +244,61 @@ class Assets:
         s = self.car_src[(color, o)]
         flip = (heading == "W", heading == "S")
         return self.scaled(s, 1, flip) if any(flip) else s
+
+    def _load_pack3_assets(self):
+        pack_meta_path = self.root / "atlas_metadata.json"
+        if not pack_meta_path.is_file():
+            return {}, {}
+        pack_meta = json.loads(pack_meta_path.read_text(encoding="utf-8"))
+        sheets = pack_meta.get("sheets", {})
+        buildings = {}
+        vehicles = {}
+
+        building_path = self.root / "buildings" / "01_buildings_variations.png"
+        building_sheet_meta = sheets.get("01_buildings_variations.png")
+        if building_path.is_file() and isinstance(building_sheet_meta, dict):
+            sheet = pygame.image.load(str(building_path)).convert_alpha()
+            for name, states in building_sheet_meta.get("buildings", {}).items():
+                buildings[name] = {}
+                for state, rect in states.items():
+                    buildings[name][state] = sheet.subsurface(
+                        R(rect)
+                    ).copy()
+
+        vehicle_path = self.root / "vehicles" / "05_vehicles_and_street_props.png"
+        vehicle_sheet_meta = sheets.get("05_vehicles_and_street_props.png")
+        if vehicle_path.is_file() and isinstance(vehicle_sheet_meta, dict):
+            sheet = pygame.image.load(str(vehicle_path)).convert_alpha()
+            for name, directions in vehicle_sheet_meta.get("vehicles", {}).items():
+                vehicles[name] = {}
+                for direction, rect in directions.items():
+                    vehicles[name][direction] = sheet.subsurface(
+                        R(rect)
+                    ).copy()
+        return buildings, vehicles
+
+    def building_pack(self, name, state="active", size=(64, 64)):
+        source = self.pack_buildings.get(name, {}).get(state)
+        if source is None:
+            source = self.pack_buildings.get("house_small", {}).get(state)
+        if source is None:
+            return self.building("house_0")
+        key = ("pack_building", name, state, size)
+        if key not in self._cache:
+            self._cache[key] = pygame.transform.scale(source, size)
+        return self._cache[key]
+
+    def vehicle_pack(self, name, direction="right", size=None):
+        source = self.pack_vehicles.get(name, {}).get(direction)
+        if source is None:
+            return None
+        key = ("pack_vehicle", name, direction, size)
+        if key not in self._cache:
+            self._cache[key] = (
+                pygame.transform.scale(source, size)
+                if size is not None else source
+            )
+        return self._cache[key]
 
     # ------------------------------------------------------------------ tombol & panel dari sprite
     def _make_blank_buttons(self):

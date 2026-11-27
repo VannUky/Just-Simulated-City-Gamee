@@ -47,6 +47,8 @@ class GameScene:
         self.speed_i = 1
         self.tab = 0
         self.sel = None
+        self.profile_pos = [W // 2 - 250, H // 2 - 300]
+        self.profile_drag = None
         self.people_query = ""
         self.people_search_focus = False
         self.people_search_rect = None
@@ -162,6 +164,8 @@ class GameScene:
         self.draw_bottom()
         if self.window:
             self.draw_window()
+        if self.sel is not None and self.tab == 1:
+            self.draw_citizen_profile()
         self.draw_toast()
         if self.hover_lot is not None and not self.window and not self.menu_open and not ui.tip:
             tip = self.lot_tip(self.hover_lot)
@@ -431,89 +435,143 @@ class GameScene:
                 ui.hits.append((row, lambda p, q=q: setattr(self, "sel", q)))
             ui.scrollbar("people", area, len(citizens) * row_h)
             return
+        ui.text("PROFIL TERBUKA DI JENDELA TENGAH", (x, y), MUTED, "xs")
+        ui.text("Seret bagian atas untuk memindahkan.", (x, y + 18), MUTED, "xs")
+        ui.button((x, y + 44, A.w, 28), "TUTUP PROFIL", lambda: setattr(self, "sel", None), "exit", 1)
+        return
+
+    def draw_citizen_profile(self):
+        ui, w, c = self.ui, self.world, self.sel
+        if c is None or c not in w.citizens:
+            return
+        r = pygame.Rect(*self.profile_pos, 500, 600)
+        r.x = max(8, min(W - r.w - 8, r.x))
+        r.y = max(8, min(H - r.h - 8, r.y))
+        self.profile_pos = [r.x, r.y]
+        ui.shadow_panel(r, "cream")
+
+        title = pygame.Rect(r.x, r.y, r.w, 34)
+        pygame.draw.rect(ui.screen, INK, title, border_radius=6)
+        ui.bmp(c.name.upper()[:28], (title.x + 12, title.y + 9), 1, WHITE)
+        ui.button((r.right - 34, r.y + 5, 28, 24), "X",
+                  lambda: setattr(self, "sel", None), "exit", 1)
+
         v = self.cv.views.get(c.id)
+        portrait_x = r.x + 12
+        portrait_y = r.y + 44
         if v:
-            ui.panel((x, y, 64, 76), "dark", 1)
-            ui.screen.blit(pygame.transform.scale(v.idle, (40, 56)), (x + 12, y + 10))
-            if v.emote:
-                em = self.a.emotes[v.emote[0]]["composed"]
-                ui.screen.blit(self.a.scaled(em[int(self.cv.t * 5) % 4], 2), (x + 64, y + 4))
-        ui.text(c.name.upper()[:20], (x + 74, y + 40), INK, "m")
-        ui.text(f"{c.label} · {'P' if c.female else 'L'} · {int(c.age)} th", (x + 74, y + 58), MUTED, "xs")
-        ui.button((A.right - 26, y, 26, 24), "X", lambda: setattr(self, "sel", None), "exit", 1, tip="Lepas pilihan")
-        y += 86
-        job = c.job.name if c.job else ("Pemilik " + c.business.name if c.business else "Menganggur")
-        rows = [("Kerja", job), ("Tunai", rp(c.cash)), ("Tabungan", rp(c.savings)),
-                ("Total aset", rp(c.assets)), ("Utang", rp(c.debt)), ("Kekayaan bersih", rp(c.networth)),
-                ("Plafon utang tanpa agunan", rp(w.unsecured_limit(c))),
-                ("Kendaraan", rp(c.vehicle_value) if c.vehicle_value else "Tidak punya"),
-                ("Rumah", ("milik sendiri" if c.home and c.home.owner is c else ("sewa" if c.home else "tunawisma"))
-                 + (f" (+{len(c.houses)} sewa)" if c.houses else "")),
-                ("AI / literasi uang", f"{c.learning * 100:.0f}% / {c.financial_literacy * 100:.0f}%"),
-                ("Emosi", f"{c.emotion} · stres {c.stress * 100:.0f}% · takut {c.fear * 100:.0f}%"),
-                ("Sedih / depresi", f"{c.sadness * 100:.0f}% / {c.depression * 100:.0f}%"),
-                ("Gig terakhir", f"{c.last_gig or 'belum'} · total {c.gigs_done}"),
-                ("Catatan kriminal", str(c.crimes)),
-                ("Sehat/Senang", f"{c.health:.0f} / {c.happy:.0f}")]
-        for k, val in rows:
-            ui.text(k, (x, y), MUTED)
-            ui.text(val[:24], (A.right, y), INK, "s", "r")
-            y += 17
-        hold = ", ".join(f"{s} {h[0]:.1f}" for s, h in list(c.hold.items())[:3])
-        if hold:
-            ui.text("Pegang: " + hold[:32], (x, y), MUTED)
-            y += 17
-        observation = w.agent_observation(c)
-        if observation is not None:
-            top_goal = observation["desires"][0]["id"] if observation["desires"] else "tidak ada"
-            intention = observation["intention"]
-            intention_text = (
-                intention["goal_id"] if intention is not None else "tidak ada"
+            ui.panel((portrait_x, portrait_y, 68, 82), "dark", 1)
+            ui.screen.blit(
+                pygame.transform.scale(v.idle, (44, 62)),
+                (portrait_x + 12, portrait_y + 10),
             )
-            ui.text("OBSERVASI AGEN", (x, y), INK, "xs")
-            y += 15
-            ui.text("Tujuan", (x, y), MUTED, "xs")
-            ui.text(top_goal[:24], (A.right, y), INK, "xs", "r")
-            y += 14
-            ui.text("Niat", (x, y), MUTED, "xs")
-            ui.text(intention_text[:24], (A.right, y), INK, "xs", "r")
-            y += 14
-            ui.text("Strategi", (x, y), MUTED, "xs")
+        ui.text(c.label, (r.x + 92, portrait_y + 4), BLUE, "m")
+        ui.text(
+            f"{'Perempuan' if c.female else 'Laki-laki'} · "
+            f"{int(c.age)} tahun · {c.emotion}",
+            (r.x + 92, portrait_y + 25),
+            MUTED, "xs",
+        )
+        job = (
+            c.job.name if c.job
+            else ("Pemilik " + c.business.name if c.business else "Menganggur")
+        )
+        ui.text(job[:38], (r.x + 92, portrait_y + 43), INK, "s")
+        ui.text(
+            f"Kekayaan bersih  {rp(c.networth)}",
+            (r.x + 92, portrait_y + 62),
+            GREEN, "s",
+        )
+
+        y = r.y + 132
+        left = r.x + 12
+        right = r.right - 12
+        ui.text("KEADAAN", (left, y), INK, "xs")
+        y += 16
+        for label, value, color in (
+            ("Tunai", c.cash, GREEN),
+            ("Tabungan", c.savings, BLUE),
+            ("Aset", c.assets, GOLD),
+            ("Utang", c.debt, RED),
+        ):
+            ui.text(label, (left, y), MUTED, "xs")
+            ui.text(rp(value), (right, y), color, "xs", "r")
+            y += 16
+        ui.text(
+            f"Rumah: {'milik sendiri' if c.home and c.home.owner is c else ('sewa' if c.home else 'tunawisma')}",
+            (left, y), MUTED, "xs",
+        )
+        y += 16
+        ui.text(
+            f"Kendaraan: {rp(c.vehicle_value) if c.vehicle_value else 'tidak punya'}",
+            (left, y), MUTED, "xs",
+        )
+        y += 22
+
+        ui.text("KEMAMPUAN", (left, y), INK, "xs")
+        y += 16
+        traits = (
+            ("AI", c.learning),
+            ("Literasi", c.financial_literacy),
+            ("Skill", c.skill),
+            ("Usaha", c.entre),
+            ("Bicara", c.persuasion),
+            ("Bangunan", c.construction_skill),
+            ("Servis", c.repair_skill),
+            ("Risiko", c.risk),
+        )
+        for i, (label, value) in enumerate(traits):
+            cx = left if i % 2 == 0 else r.centerx + 8
+            cy = y + (i // 2) * 24
+            ui.text(label, (cx, cy), MUTED, "xs")
+            ui.bar((cx + 58, cy + 2, 122, 10), max(0.0, min(1.0, value)), BLUE)
+        y += ((len(traits) + 1) // 2) * 24 + 8
+
+        ui.text("KEPRIBADIAN & EMOSI", (left, y), INK, "xs")
+        y += 16
+        for i, (label, value) in enumerate((
+            ("Stres", c.stress),
+            ("Takut", c.fear),
+            ("Sedih", c.sadness),
+            ("Depresi", c.depression),
+            ("Hemat", c.frugal),
+            ("Optimis", c.optimism),
+        )):
+            cx = left if i % 2 == 0 else r.centerx + 8
+            cy = y + (i // 2) * 24
+            ui.text(label, (cx, cy), MUTED, "xs")
+            ui.bar((cx + 58, cy + 2, 122, 10), max(0.0, min(1.0, value)),
+                   RED if label in ("Stres", "Takut", "Sedih", "Depresi") else GOLD)
+
+        observation = w.agent_observation(c)
+        bottom = r.bottom - 100
+        ui.text("OBSERVASI AGEN", (left, bottom), INK, "xs")
+        if observation:
+            goal = observation["desires"][0]["id"] if observation["desires"] else "tidak ada"
+            intention = observation["intention"]
+            planned = intention["goal_id"] if intention else "tidak ada"
+            ui.text(f"Tujuan: {goal[:28]}", (left, bottom + 16), MUTED, "xs")
+            ui.text(f"Niat: {planned[:28]}", (left, bottom + 32), MUTED, "xs")
             ui.text(
                 f"{observation['learning']['contexts']} konteks · "
-                f"{observation['learning']['arms']} aksi",
-                (A.right, y), INK, "xs", "r",
-            )
-            y += 14
-            ui.text("Pengetahuan / sosial", (x, y), MUTED, "xs")
-            ui.text(
                 f"{len(observation['validated_claims'])} klaim · "
                 f"{len(observation['social']['relations'])} relasi",
-                (A.right, y), INK, "xs", "r",
+                (left, bottom + 48),
+                MUTED, "xs",
             )
-            y += 16
-        y += 4
-        traits = [("Risiko", c.risk), ("Serakah", c.greed), ("Hemat", c.frugal), ("Ikut tren", c.herd),
-                  ("Optimis", c.optimism), ("Sabar", c.patience), ("Skill", c.skill), ("Jiwa usaha", c.entre),
-                  ("Bicara", c.persuasion), ("Bangunan", c.construction_skill), ("Servis", c.repair_skill)]
-        for i, (k, val) in enumerate(traits):
-            cx, cy = x + (i % 2) * 134, y + (i // 2) * 16
-            ui.text(k, (cx, cy), MUTED, "xs")
-            ui.bar((cx + 58, cy + 2, 64, 9), val, BLUE)
-        y += 86
-        hw = (A.w - 12) // 4
-        for i, (lab, d) in enumerate((("+1JT", 1e6), ("+10JT", 1e7), ("+100JT", 1e8), ("-1JT", -1e6))):
-            ui.button((x + i * (hw + 4), y, hw, 24), lab, lambda d=d: w.edit_cash(c, d), "new_city" if d > 0 else "exit", 1)
-        y += 28
-        ui.button((x, y, A.w, 24), "SET UANG TUNAI - M", lambda: self.open_prompt(f"Uang tunai {c.first}", lambda val: w.set_cash(c, val)), "options", 1)
-        y += 32
-        ui.text("PIKIRAN TERAKHIR", (x, y), INK, "s")
-        y += 18
-        for day, msg in list(c.thoughts)[:4]:
-            for ln in ui.wrap(f"[{day}] {msg}", 36)[:2]:
-                if y < A.bottom - 12:
-                    ui.text(ln, (x, y), (70, 74, 86), "xs")
-                y += 14
+
+        hw = (r.w - 28) // 4
+        for i, (label, delta) in enumerate((
+            ("+1 JT", 1_000_000), ("+10 JT", 10_000_000),
+            ("+100 JT", 100_000_000), ("-1 JT", -1_000_000),
+        )):
+            ui.button(
+                (left + i * (hw + 3), r.bottom - 28, hw, 22),
+                label,
+                lambda delta=delta: w.edit_cash(c, delta),
+                "new_city" if delta > 0 else "exit",
+                1,
+            )
 
     def tab_news(self, A):
         ui, a, w = self.ui, self.a, self.world
@@ -583,6 +641,47 @@ class GameScene:
                 elif e.unicode and e.unicode.isprintable() and len(self.prompt["text"]) < 16:
                     self.prompt["text"] += e.unicode
             return
+        if self.sel is not None and self.tab == 1:
+            profile = pygame.Rect(*self.profile_pos, 500, 600)
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE:
+                    self.sel = None
+                    self.profile_drag = None
+                return
+            if e.type == pygame.MOUSEBUTTONDOWN:
+                if e.button == 1 and profile.collidepoint(e.pos):
+                    close = pygame.Rect(profile.right - 34, profile.y + 5, 28, 24)
+                    if close.collidepoint(e.pos):
+                        self.ui.click(e.pos)
+                        return
+                    title = pygame.Rect(profile.x, profile.y, profile.w - 40, 34)
+                    if title.collidepoint(e.pos):
+                        self.profile_drag = (
+                            e.pos[0] - profile.x,
+                            e.pos[1] - profile.y,
+                        )
+                    else:
+                        self.ui.click(e.pos)
+                return
+            if e.type == pygame.MOUSEBUTTONUP:
+                if e.button == 1:
+                    self.profile_drag = None
+                return
+            if e.type == pygame.MOUSEMOTION:
+                if self.profile_drag is not None:
+                    dx, dy = self.profile_drag
+                    self.profile_pos = [
+                        max(8, min(W - profile.w - 8, e.pos[0] - dx)),
+                        max(8, min(H - profile.h - 8, e.pos[1] - dy)),
+                    ]
+                return
+            if e.type == pygame.MOUSEWHEEL:
+                if profile.collidepoint(pygame.mouse.get_pos()):
+                    self.ui.wheel(e.y)
+                return
+            if e.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                          pygame.MOUSEMOTION):
+                return
         if self.people_search_focus and e.type == pygame.KEYDOWN:
             if e.key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.people_search_focus = False

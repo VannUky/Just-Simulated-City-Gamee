@@ -168,8 +168,14 @@ class CityView:
             by = ground.centery + rng.randint(4, 14)
             self.props.append((by + 16, a.scaled(a.props["park_bench"], 2), (bx - 16, by - 16)))
             return
-        pygame.draw.rect(s, P["C"] if lot.kind in ("hall", "exchange") else P["c"], ground, border_radius=3)
-        pygame.draw.rect(s, P["K"], ground, 1, border_radius=3)
+        ground_color = (
+            P["e"] if lot.kind == "house"
+            else P["C"] if lot.kind in ("hall", "exchange")
+            else P["c"]
+        )
+        pygame.draw.rect(s, ground_color, ground, border_radius=3)
+        pygame.draw.rect(s, P["g"] if lot.kind == "house" else P["K"],
+                         ground, 1, border_radius=3)
         # jalan setapak + keset pintu menuju jalan
         cx = int(lot.door[0])
         walk_y = y if top else y + lh - 9
@@ -177,9 +183,7 @@ class CityView:
         pygame.draw.rect(s, P["D"], (cx - 3, y + 1 if top else y + lh - 4, 6, 3))
         bx, by = x + (lw - 64) // 2, y + (lh - 52) // 2
         if lot.kind == "house":
-            pygame.draw.rect(s, (190, 184, 166), (bx + 3, by + 4, 64, 52))
-            s.blit(a.building(f"house_{lot.building.color_i}", flip=(lot.building.color_i + int(x)) % 2 == 0), (bx, by))
-            self.label(s, "APARTEMEN", (bx + 32, by + 24), 1)
+            return
         elif lot.kind in ("hall", "exchange"):
             pygame.draw.rect(s, (190, 184, 166), (bx + 3, by + 4, 64, 52))
             s.blit(a.building(lot.kind), (bx, by))
@@ -422,7 +426,22 @@ class CityView:
         a = self.a
         bx, by = self.sprite_pos(b.lot)
         pygame.draw.rect(s, (190, 184, 166), (bx + 3, by + 4, 64, 52))
-        sprite = a.building("shop" if b.kind in ("shop", "showroom") else "factory")
+        pack_name = {
+            "shop": "shop_retail",
+            "showroom": "showroom",
+            "factory": "factory",
+            "car_factory": "factory",
+            "farm": "farm_garden",
+            "builder": "shop_retail",
+            "repair": "shop_retail",
+            "delivery": "shop_retail",
+            "cleaning": "shop_retail",
+        }.get(b.kind)
+        sprite = (
+            a.building_pack(pack_name, "bankrupt" if b.last_profit < 0 else "active")
+            if pack_name in a.pack_buildings
+            else a.building("shop" if b.kind in ("shop", "showroom") else "factory")
+        )
         if b.kind == "farm":
             sprite = sprite.copy()
             sprite.fill((145, 210, 135, 255), special_flags=pygame.BLEND_RGBA_MULT)
@@ -472,6 +491,31 @@ class CityView:
         self.draw_layer(s)
         for b in w.businesses:
             self.draw_business(s, b)
+        for h in w.houses:
+            state = (
+                "constructing"
+                if getattr(h, "construction_until", -1) > w.day
+                else "active"
+            )
+            names = ("house_small", "house_medium", "house_luxury")
+            name = names[min(2, max(0, h.color_i // 2))]
+            bx, by = self.sprite_pos(h.lot)
+            s.blit(a.building_pack(name, state, (64, 64)), (bx, by - 12))
+        for b in w.businesses:
+            if b.kind not in ("delivery", "builder"):
+                continue
+            vehicle_name = (
+                "construction_vehicle" if b.kind == "builder"
+                else "delivery_truck"
+            )
+            direction = "right" if b.lot.door[0] > b.lot.rect[0] else "left"
+            vehicle = a.vehicle_pack(vehicle_name, direction, (32, 32))
+            if vehicle is not None:
+                s.blit(
+                    vehicle,
+                    (int(b.lot.door[0] - vehicle.get_width() / 2),
+                     int(b.lot.door[1] - vehicle.get_height() / 2)),
+                )
         night = darkness(w.hour) if self.opt.day_night else 0.0
         ents = [(p[0], 0, p) for p in self.props]
         for ln, lx, ly in self._lamp_cache():

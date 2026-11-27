@@ -1,3 +1,4 @@
+import copy
 import pickle
 import math
 import unittest
@@ -221,7 +222,8 @@ class AccountingLedgerTests(unittest.TestCase):
             buyer.cash, buyer.savings, buyer.exp_acc,
             world.bank.cash, world.bank.deposits,
             farm.cash, farm.stock, world.treasury,
-            tuple(world.trade_contracts), len(world.ledger.entries),
+            tuple(world.trade_contracts), world.next_trade_id,
+            copy.deepcopy(world.social_state), len(world.ledger.entries),
         )
 
         with patch.object(world.ledger, "record_snapshot_change",
@@ -233,7 +235,8 @@ class AccountingLedgerTests(unittest.TestCase):
             (buyer.cash, buyer.savings, buyer.exp_acc,
              world.bank.cash, world.bank.deposits,
              farm.cash, farm.stock, world.treasury,
-             tuple(world.trade_contracts), len(world.ledger.entries)),
+             tuple(world.trade_contracts), world.next_trade_id,
+             world.social_state, len(world.ledger.entries)),
             before,
         )
         self.assertEqual(world.reconcile_ledger(), {})

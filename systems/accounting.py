@@ -9,6 +9,40 @@ import math
 DEBIT = "debit"
 CREDIT = "credit"
 _EPSILON = 1e-7
+_BUSINESS_ONLY_TRANSACTION_METHODS = frozenset((
+    "production_cycle",
+    "adjust_prices",
+    "shop_restock",
+    "showroom_daily",
+    "vehicle_restock",
+    "weekly_business",
+))
+_BUSINESS_FREE_TRANSACTION_METHODS = frozenset((
+    "purchase_emergency_ration",
+))
+_WORLD_TRANSACTION_FIELDS = {
+    "purchase_emergency_ration": ("treasury",),
+    "deposit": (),
+    "withdrawal": (),
+    "payment": (),
+    "weekly_start": ("treasury", "rev_ma", "rev_week"),
+    "payroll": ("treasury", "rev_week"),
+    "gig_market": ("treasury", "gig_count"),
+    "crime_daily": ("treasury", "rev_week", "events", "_ev", "crime_history"),
+    "government_cycle": (
+        "treasury", "next_election_day", "mayor_id", "government_learning",
+        "events", "_ev",
+    ),
+    "random_event": ("last_random_event", "treasury", "events", "_ev"),
+    "production_cycle": (
+        "import_supply_remaining", "trade_contracts", "next_trade_id",
+    ),
+    "adjust_prices": (),
+}
+_BUY_GOODS_TRANSACTION = object()
+_SKIP_RELATED_TRANSACTION_METHODS = frozenset((
+    "purchase_emergency_ration",
+))
 _BROAD_TRANSACTION_FIELDS = {
     "weekly_start": {
         "Citizen": ("cash", "job", "thoughts"),
@@ -56,6 +90,21 @@ _BROAD_TRANSACTION_FIELDS = {
         "Citizen": ("cash", "savings", "exp_acc"),
         "Business": ("cash", "exp"),
     },
+    "deposit": {
+        "Citizen": ("cash", "savings"),
+        "Bank": ("cash", "deposits"),
+    },
+    "withdrawal": {
+        "Citizen": ("cash", "savings"),
+        "Bank": ("cash", "deposits"),
+    },
+    "payment": {
+        "Citizen": ("cash", "savings", "exp_acc"),
+        "Bank": ("cash", "deposits"),
+    },
+    "government_cycle": {
+        "Citizen": ("learning", "financial_literacy", "thoughts"),
+    },
     "production_cycle": {
         "Business": (
             "cash", "input_inventory", "input_costs", "service_inventory",
@@ -95,6 +144,92 @@ def _copy_containers(value):
     return value
 
 
+def _copy_transaction_field(name, value):
+    if name == "trade_contracts" and isinstance(value, deque):
+        return deque(value, maxlen=value.maxlen)
+    return _copy_containers(value)
+
+
+def _capture_buy_goods_state(root, args, business_ids):
+    social_state = root.social_state
+    relationships = social_state["relationships"]
+    reputation = social_state["reputation"]
+    events = social_state["events"]
+    buyer = args[0] if args else None
+    buyer_id = getattr(buyer, "id", None)
+    owner_ids = set()
+    for business in root.businesses:
+        if business_ids is not None and business.ledger_id not in business_ids:
+            continue
+        owner = getattr(business, "owner", None)
+        if owner is not None and hasattr(owner, "id"):
+            owner_ids.add(owner.id)
+    relationship_keys = set()
+    if buyer_id is not None:
+        for owner_id in owner_ids:
+            if owner_id != buyer_id:
+                relationship_keys.add(f"{buyer_id}:{owner_id}")
+                relationship_keys.add(f"{owner_id}:{buyer_id}")
+
+    def capture_keys(mapping, keys):
+        return {
+            key: (
+                key in mapping,
+                _copy_containers(mapping[key]) if key in mapping else None,
+            )
+            for key in keys
+        }
+
+    return {
+        "fields": {
+            name: _copy_containers(getattr(root, name))
+            for name in ("treasury", "rev_week", "sales_today", "next_trade_id")
+        },
+        "trade_contracts": deque(
+            root.trade_contracts, maxlen=root.trade_contracts.maxlen
+        ),
+        "social_state": social_state,
+        "relationships": relationships,
+        "relationship_values": capture_keys(relationships, relationship_keys),
+        "reputation": reputation,
+        "reputation_values": capture_keys(
+            reputation,
+            {str(citizen_id) for citizen_id in owner_ids | (
+                {buyer_id} if buyer_id is not None else set()
+            )},
+        ),
+        "events": events,
+        "event_values": list(events),
+    }
+
+
+def _restore_buy_goods_state(root, state):
+    for name, value in state["fields"].items():
+        setattr(root, name, value)
+    root.trade_contracts = state["trade_contracts"]
+
+    social_state = state["social_state"]
+    root.social_state = social_state
+    relationships = state["relationships"]
+    reputation = state["reputation"]
+    events = state["events"]
+    social_state["relationships"] = relationships
+    social_state["reputation"] = reputation
+    social_state["events"] = events
+
+    for key, (existed, value) in state["relationship_values"].items():
+        if existed:
+            relationships[key] = value
+        else:
+            relationships.pop(key, None)
+    for key, (existed, value) in state["reputation_values"].items():
+        if existed:
+            reputation[key] = value
+        else:
+            reputation.pop(key, None)
+    events[:] = state["event_values"]
+
+
 def _capture_transaction_state(root, args, citizen_ids, business_ids,
                                include_all, include_businesses,
                                track_world_collections, method_name):
@@ -131,12 +266,15 @@ def _capture_transaction_state(root, args, citizen_ids, business_ids,
             add_domain_objects(root.businesses)
             add_domain_objects(root.houses)
             add_domain_objects(root.lots)
-        for citizen in root.citizens:
-            if citizen_ids is None or citizen.id in citizen_ids:
-                objects[id(citizen)] = citizen
+        if (include_all or citizen_ids is not None
+                or method_name not in _BUSINESS_ONLY_TRANSACTION_METHODS):
+            for citizen in root.citizens:
+                if citizen_ids is None or citizen.id in citizen_ids:
+                    objects[id(citizen)] = citizen
         for business in root.businesses:
-            if (business_ids is None or include_businesses
-                    or business.ledger_id in business_ids):
+            if (method_name not in _BUSINESS_FREE_TRANSACTION_METHODS
+                    and (business_ids is None or include_businesses
+                    or business.ledger_id in business_ids)):
                 objects[id(business)] = business
         for value in args:
             add_domain_objects(value)
@@ -147,13 +285,15 @@ def _capture_transaction_state(root, args, citizen_ids, business_ids,
 
     objects[id(root.bank)] = root.bank
     if method_name == "government_cycle":
+        add_domain_objects(root.citizens)
         objects[id(root.policy)] = root.policy
 
     related_fields = (
         "owner", "borrower", "ref", "home", "business", "job",
         "lot", "building", "land_owner",
     )
-    if method_name not in _BROAD_TRANSACTION_FIELDS:
+    if (method_name not in _BROAD_TRANSACTION_FIELDS
+            and method_name not in _SKIP_RELATED_TRANSACTION_METHODS):
         for value in tuple(objects.values()):
             if value is root:
                 continue
@@ -167,6 +307,21 @@ def _capture_transaction_state(root, args, citizen_ids, business_ids,
     snapshots = []
     world_collections = {"citizens", "businesses", "houses", "loans"}
     for value in objects.values():
+        if value is root and method_name == "buy_goods":
+            snapshots.append((
+                value,
+                _capture_buy_goods_state(value, args, business_ids),
+                _BUY_GOODS_TRANSACTION,
+            ))
+            continue
+        if value is root and method_name in _WORLD_TRANSACTION_FIELDS:
+            fields = _WORLD_TRANSACTION_FIELDS[method_name]
+            state = {
+                name: _copy_transaction_field(name, getattr(value, name))
+                for name in fields
+            }
+            snapshots.append((value, state, fields))
+            continue
         fields = _BROAD_TRANSACTION_FIELDS.get(method_name, {}).get(
             type(value).__name__
         )
@@ -196,6 +351,9 @@ def _capture_transaction_state(root, args, citizen_ids, business_ids,
 def _restore_transaction_state(snapshot):
     object_states, random_states = snapshot
     for value, state, fields in object_states:
+        if fields is _BUY_GOODS_TRANSACTION:
+            _restore_buy_goods_state(value, state)
+            continue
         if fields is None:
             value.__dict__.clear()
             value.__dict__.update(state)

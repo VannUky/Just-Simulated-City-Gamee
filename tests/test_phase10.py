@@ -1,6 +1,8 @@
 import pickle
 import time
 import unittest
+from pathlib import Path
+import pygame
 
 from main import SAVE_SCHEMA_VERSION, _migrate_save_v3_to_v4
 from systems.ekonomi_core import World
@@ -74,9 +76,10 @@ class Phase10ObservationTests(unittest.TestCase):
         world = World(seed=1301, n_pop=140)
         started = time.perf_counter()
         for _ in range(30):
-            world.daily()
+            world.advance(24)
         elapsed = time.perf_counter() - started
 
+        self.assertEqual(world.day, 30)
         self.assertLessEqual(len(world.citizens), world.max_population)
         self.assertEqual(world.reconcile_ledger(), {})
         self.assertGreaterEqual(world.civilization_observation()["population"], 1)
@@ -104,6 +107,40 @@ class Phase10ObservationTests(unittest.TestCase):
             migrated_again["world"].agent_observation(restored.citizens[0]),
             first_observation,
         )
+
+    def test_house_sale_cooldown_and_construction_state(self):
+        world = World(seed=1501, n_pop=2)
+        seller, buyer = world.citizens
+        house = world.houses[0]
+        house.owner = seller
+        seller.houses = [house]
+        house.last_sale_day = world.day
+        buyer.cash = 1_000_000_000.0
+        world._initialize_ledger()
+
+        self.assertFalse(world.buy_house(buyer, house))
+        self.assertIs(house.owner, seller)
+
+        house.last_sale_day = world.day - 30
+        house.construction_until = world.day + 5
+        self.assertFalse(world.buy_house(buyer, house))
+        house.construction_until = -1
+        self.assertTrue(world.buy_house(buyer, house))
+        self.assertIs(house.owner, buyer)
+
+    def test_pack3_building_and_vehicle_assets_are_loaded(self):
+        from game.assets import Assets
+
+        pygame.init()
+        pygame.display.set_mode((1, 1))
+        assets = Assets(Path(__file__).resolve().parents[1] / "assets")
+        house = assets.building_pack("house_small", "active")
+        truck = assets.vehicle_pack("delivery_truck", "right", (32, 32))
+        construction = assets.building_pack("house_small", "constructing")
+
+        self.assertIsNotNone(house)
+        self.assertIsNotNone(truck)
+        self.assertIsNotNone(construction)
 
 
 if __name__ == "__main__":
