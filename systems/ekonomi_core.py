@@ -1417,16 +1417,27 @@ class World:
             business.price / max(0.5, min(1.5, business.quality)),
             -business.service_inventory.get(product, 0.0),
         ))
+        if not providers:
+            return 0.0
+        if not math.isfinite(c.cash) or not math.isfinite(c.savings):
+            raise ValueError("Saldo dana warga tidak valid.")
+        available_funds = max(0.0, c.cash) + max(0.0, c.savings)
+        if not math.isfinite(available_funds):
+            raise ValueError("Dana pembelian jasa tidak valid.")
         if seller is not None and (
                 seller.service_inventory.get(product, 0.0) < quantity
-                or c.cash < quantity * seller.price * (1 + self.policy.tax_ppn)):
+                or available_funds
+                < quantity * seller.price * (1 + self.policy.tax_ppn)):
             return 0.0
         remaining = quantity
         completed = 0.0
         for provider in providers:
             available = provider.service_inventory.get(product, 0.0)
             gross_unit_price = provider.price * (1 + self.policy.tax_ppn)
-            affordable = c.cash / gross_unit_price
+            available_funds = max(0.0, c.cash) + max(0.0, c.savings)
+            if not math.isfinite(available_funds):
+                raise ValueError("Dana pembelian jasa tidak valid.")
+            affordable = available_funds / gross_unit_price
             traded = min(remaining, available, affordable)
             if traded <= 1e-9:
                 continue

@@ -438,6 +438,28 @@ class EconomyCoreTests(unittest.TestCase):
         self.assertEqual(contract["status"], "settled")
         self.assertEqual(world.reconcile_ledger(), {})
 
+    def test_service_contract_can_be_paid_entirely_from_savings(self):
+        world = World(seed=24, n_pop=12)
+        provider_owner, buyer = world.citizens[:2]
+        world.set_cash(provider_owner, 100_000_000)
+        world.set_cash(buyer, 2_000_000)
+        self.assertTrue(world.found_business(provider_owner, "repair", force=True))
+        provider = provider_owner.business
+        provider.service_inventory["repair"] = 1.0
+        provider.service_costs["repair"] = 20_000.0
+        world._initialize_ledger()
+        world.deposit(buyer, buyer.cash)
+        price = provider.price
+        gross = price * (1 + world.policy.tax_ppn)
+        savings_before = buyer.savings
+
+        bought = world.buy_service(buyer, "repair", 1.0)
+
+        self.assertAlmostEqual(bought, 1.0)
+        self.assertEqual(buyer.cash, 0)
+        self.assertAlmostEqual(buyer.savings, savings_before - gross)
+        self.assertEqual(world.reconcile_ledger(), {})
+
     def test_goods_market_contract_records_tax_and_inventory_settlement(self):
         world = World(seed=22, n_pop=12)
         buyer, owner = world.citizens[:2]
@@ -511,6 +533,63 @@ class EconomyCoreTests(unittest.TestCase):
         self.assertEqual(
             (buyer.cash, dict(builder.service_inventory), tuple(world.trade_contracts),
              len(world.houses)),
+            before,
+        )
+        self.assertEqual(world.reconcile_ledger(), {})
+
+    def test_house_construction_can_be_paid_from_savings(self):
+        world = World(seed=25, n_pop=12)
+        buyer, contractor_owner = world.citizens[:2]
+        world.set_cash(buyer, 50_000_000)
+        world.set_cash(contractor_owner, 100_000_000)
+        lot = world.buy_land(buyer)
+        self.assertIsNotNone(lot)
+        self.assertTrue(world.found_business(contractor_owner, "builder", force=True))
+        builder = contractor_owner.business
+        builder.service_inventory["construction"] = 1.0
+        builder.service_costs["construction"] = 1_000_000.0
+        world._initialize_ledger()
+        world.deposit(buyer, buyer.cash)
+        self.assertEqual(buyer.cash, 0)
+        self.assertGreater(buyer.savings, builder.price * (1 + world.policy.tax_ppn))
+
+        home = world.build_house(buyer, lot)
+
+        self.assertIsNotNone(home)
+        self.assertEqual(buyer.cash, 0)
+        self.assertGreater(buyer.savings, 0)
+        self.assertEqual(world.reconcile_ledger(), {})
+
+    def test_service_purchase_from_savings_rolls_back_on_ledger_failure(self):
+        world = World(seed=26, n_pop=12)
+        provider_owner, buyer = world.citizens[:2]
+        world.set_cash(provider_owner, 100_000_000)
+        world.set_cash(buyer, 2_000_000)
+        self.assertTrue(world.found_business(provider_owner, "repair", force=True))
+        provider = provider_owner.business
+        provider.service_inventory["repair"] = 1.0
+        provider.service_costs["repair"] = 20_000.0
+        world._initialize_ledger()
+        world.deposit(buyer, buyer.cash)
+        before = (
+            buyer.cash, buyer.savings, world.bank.cash, world.bank.deposits,
+            provider.cash, provider.rev, dict(provider.service_inventory),
+            world.treasury, world.sales_today, tuple(world.trade_contracts),
+            len(world.ledger.entries),
+        )
+
+        with patch.object(world.ledger, "record_snapshot_change",
+                          side_effect=ValueError("injected ledger failure")):
+            with self.assertRaisesRegex(ValueError, "injected ledger failure"):
+                world.buy_service(buyer, "repair", 1.0)
+
+        self.assertEqual(
+            (
+                buyer.cash, buyer.savings, world.bank.cash, world.bank.deposits,
+                provider.cash, provider.rev, dict(provider.service_inventory),
+                world.treasury, world.sales_today, tuple(world.trade_contracts),
+                len(world.ledger.entries),
+            ),
             before,
         )
         self.assertEqual(world.reconcile_ledger(), {})
