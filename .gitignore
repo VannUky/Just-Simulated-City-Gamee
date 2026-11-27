@@ -19,3 +19,6 @@ env/
 
 # Game saves
 saves/
+
+# Instruction folder
+Instruction/
