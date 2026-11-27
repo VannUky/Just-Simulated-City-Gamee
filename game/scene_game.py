@@ -463,6 +463,35 @@ class GameScene:
         if hold:
             ui.text("Pegang: " + hold[:32], (x, y), MUTED)
             y += 17
+        observation = w.agent_observation(c)
+        if observation is not None:
+            top_goal = observation["desires"][0]["id"] if observation["desires"] else "tidak ada"
+            intention = observation["intention"]
+            intention_text = (
+                intention["goal_id"] if intention is not None else "tidak ada"
+            )
+            ui.text("OBSERVASI AGEN", (x, y), INK, "xs")
+            y += 15
+            ui.text("Tujuan", (x, y), MUTED, "xs")
+            ui.text(top_goal[:24], (A.right, y), INK, "xs", "r")
+            y += 14
+            ui.text("Niat", (x, y), MUTED, "xs")
+            ui.text(intention_text[:24], (A.right, y), INK, "xs", "r")
+            y += 14
+            ui.text("Strategi", (x, y), MUTED, "xs")
+            ui.text(
+                f"{observation['learning']['contexts']} konteks · "
+                f"{observation['learning']['arms']} aksi",
+                (A.right, y), INK, "xs", "r",
+            )
+            y += 14
+            ui.text("Pengetahuan / sosial", (x, y), MUTED, "xs")
+            ui.text(
+                f"{len(observation['validated_claims'])} klaim · "
+                f"{len(observation['social']['relations'])} relasi",
+                (A.right, y), INK, "xs", "r",
+            )
+            y += 16
         y += 4
         traits = [("Risiko", c.risk), ("Serakah", c.greed), ("Hemat", c.frugal), ("Ikut tren", c.herd),
                   ("Optimis", c.optimism), ("Sabar", c.patience), ("Skill", c.skill), ("Jiwa usaha", c.entre),

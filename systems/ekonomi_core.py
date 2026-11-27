@@ -842,7 +842,8 @@ class World:
         for attr, value in (("auto_policy", True), ("mayor_id", None),
                             ("next_election_day", self.day + DPY),
                             ("government_learning", 0.02), ("last_random_event", self.day),
-                            ("max_population", MAX_POP), ("days_per_year", DPY)):
+                            ("max_population", MAX_POP), ("days_per_year", DPY),
+                            ("observability_schema_version", 1)):
             if not hasattr(self, attr):
                 setattr(self, attr, value)
         bank = self.bank
@@ -3613,6 +3614,183 @@ class World:
 
     def gini_now(self):
         return self.series["gini"][-1] if self.series["gini"] else 0.0
+
+    def agent_observation(self, citizen):
+        """Return a read-only snapshot for observing one agent's cognitive state."""
+        if citizen not in self.citizens:
+            return None
+        state = getattr(citizen, "bdi", None)
+        learning = getattr(citizen, "adaptive_learning", None)
+        memory = getattr(citizen, "memory", None)
+        knowledge = getattr(citizen, "knowledge", None)
+        experiments = getattr(citizen, "experiments", None)
+
+        desires = [
+            {
+                "id": goal.id,
+                "priority": round(goal.priority, 3),
+                "motivation": goal.motivation,
+                "horizon": goal.horizon,
+            }
+            for goal in getattr(state, "desires", [])[:4]
+        ] if state is not None else []
+        intention = getattr(state, "intention", None)
+        beliefs = [
+            {
+                "key": belief.key,
+                "confidence": round(belief.confidence, 3),
+                "source": belief.source,
+            }
+            for belief in list(getattr(state, "beliefs", {}).values())[:8]
+        ] if state is not None else []
+        motivations = dict(sorted(
+            getattr(state, "motivations", {}).items(),
+            key=lambda item: (-item[1], item[0]),
+        )) if state is not None else {}
+        memories = memory.retrieve(
+            current_day=self.day, limit=4
+        ) if memory is not None else []
+        claims = knowledge.query(
+            status="validated", current_day=self.day, limit=8
+        ) if knowledge is not None else []
+        learned_contexts = len(getattr(learning, "contexts", {})) if learning else 0
+        learned_arms = sum(
+            len(arms) for arms in getattr(learning, "contexts", {}).values()
+        ) if learning else 0
+        active_experiment = getattr(experiments, "active", None) if experiments else None
+
+        active_relations = []
+        social = getattr(self, "social_state", {})
+        for edge in social.get("relationships", {}).values():
+            if (edge["source_id"] == citizen.id
+                    and edge["status"] == "active"):
+                active_relations.append({
+                    "target_id": edge["target_id"],
+                    "trust": round(edge["trust"], 3),
+                })
+        organizations = []
+        for organization in social.get("organizations", {}).values():
+            if (organization["status"] == "active"
+                    and str(citizen.id) in organization["members"]):
+                organizations.append({
+                    "id": organization["id"],
+                    "name": organization["name"],
+                    "kind": organization["kind"],
+                    "fund": round(organization["fund"], 2),
+                })
+        family_partner = self.family_partner(citizen)
+        return {
+            "citizen_id": citizen.id,
+            "day": self.day,
+            "desires": desires,
+            "motivations": {
+                key: round(value, 3) for key, value in motivations.items()
+            },
+            "beliefs": beliefs,
+            "intention": (
+                {
+                    "goal_id": intention.goal_id,
+                    "status": intention.status,
+                    "step": intention.next_step,
+                    "actions": list(intention.action_ids),
+                }
+                if intention is not None else None
+            ),
+            "memories": [
+                {
+                    "domain": item.domain,
+                    "action": item.action,
+                    "last_day": item.last_day,
+                    "importance": round(item.importance, 3),
+                }
+                for item in memories
+            ],
+            "validated_claims": [
+                {
+                    "a": claim.concept_a,
+                    "relation": claim.relation,
+                    "b": claim.concept_b,
+                    "confidence": round(claim.confidence, 3),
+                }
+                for claim in claims
+            ],
+            "learning": {
+                "contexts": learned_contexts,
+                "arms": learned_arms,
+                "pending": getattr(learning, "pending", None) is not None,
+            },
+            "experiment": (
+                {
+                    "id": active_experiment.id,
+                    "product": active_experiment.product,
+                    "phase": active_experiment.phase,
+                    "hypothesis": active_experiment.hypothesis,
+                }
+                if active_experiment is not None else None
+            ),
+            "social": {
+                "relations": active_relations[:8],
+                "organizations": organizations,
+                "partner_id": family_partner.id if family_partner is not None else None,
+            },
+        }
+
+    def civilization_observation(self):
+        """Return aggregate observations with explicit, deterministic definitions."""
+        citizens = self.citizens
+        adults = [citizen for citizen in citizens if is_adult(citizen)]
+        children = [citizen for citizen in citizens if not is_adult(citizen)]
+        organizations = [
+            item for item in getattr(self, "social_state", {}).get(
+                "organizations", {}
+            ).values()
+            if item["status"] == "active"
+        ]
+        active_relations = [
+            edge for edge in getattr(self, "social_state", {}).get(
+                "relationships", {}
+            ).values()
+            if edge["status"] == "active"
+        ]
+        observations = sum(
+            len(getattr(citizen, "knowledge", KnowledgeGraph()).observations)
+            for citizen in citizens
+        )
+        validated_claims = sum(
+            1 for citizen in citizens
+            for claim in getattr(
+                citizen, "knowledge", KnowledgeGraph()
+            ).claims
+            if claim.status == "validated"
+        )
+        active_experiments = sum(
+            getattr(citizen, "experiments", None).active is not None
+            for citizen in citizens
+            if getattr(citizen, "experiments", None) is not None
+        )
+        wealth = sorted(citizen.networth for citizen in citizens)
+        median = wealth[len(wealth) // 2] if wealth else 0.0
+        productivity = (
+            sum(
+                max(0.0, getattr(business, "last_profit", 0.0))
+                for business in self.businesses
+            ) / max(1, len(self.businesses))
+        )
+        return {
+            "day": self.day,
+            "population": len(citizens),
+            "adults": len(adults),
+            "children": len(children),
+            "unemployment": round(self.unemployment(), 6),
+            "gini": round(self.gini_now(), 6),
+            "median_networth": round(median, 2),
+            "average_business_profit": round(productivity, 2),
+            "active_organizations": len(organizations),
+            "active_social_relations": len(active_relations),
+            "knowledge_observations": observations,
+            "validated_claims": validated_claims,
+            "active_experiments": active_experiments,
+        }
 
     # ---- fitur pemain (edit)
     @ledgered_transaction("player_cash_adjustment", "counterpart:player_intervention")

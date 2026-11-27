@@ -319,6 +319,7 @@ def gauge_level(v, lo, hi):
 def macro_window(sc, C):
     ui, a, w = sc.ui, sc.a, sc.world
     S = w.series
+    civilization = w.civilization_observation()
     ihk = list(S["ihk"])
     infl = (ihk[-1] / ihk[-7] - 1) * 100 if len(ihk) >= 7 else 0.0
     bank_liq = w.bank.cash / max(1.0, w.bank.deposits) if w.bank.deposits > 1 else 9.9
@@ -328,7 +329,8 @@ def macro_window(sc, C):
         ("INFLASI 30 HARI", gauge_level(abs(infl), 1.5, 4), f"{infl:+.1f}%", "Harga barang vs bulan lalu", "ihk", -1),
         ("KETIMPANGAN", gauge_level(w.gini_now(), 0.35, 0.5), f"GINI {w.gini_now():.2f}", "0 = merata, 1 = timpang", "gini", -1),
         ("KESEHATAN BANK", gauge_level(-min(bank_liq, 2.0), -0.5, -0.25), (f"{min(bank_liq, 9.99) * 100:.0f}% KAS" if w.bank.deposits > 1 else "BELUM ADA"),
-         f"Tabungan {rp(w.bank.deposits)}", None, 0),
+         (f"Org {civilization['active_organizations']} · "
+          f"klaim valid {civilization['validated_claims']}"), None, 0),
     ]
     cw = (C.w - 24) // 4
     for i, (title, g, val, sub, key, _) in enumerate(cards):

@@ -45,7 +45,7 @@ ROOT = Path(__file__).resolve().parent
 ASSET_DIR = ROOT / "assets"
 SAVE_PATH = ROOT / "saves" / "slot1.sav"
 SAVE_FORMAT = "rupiahville-save"
-SAVE_SCHEMA_VERSION = 3
+SAVE_SCHEMA_VERSION = 4
 
 
 class RestrictedSaveUnpickler(pickle.Unpickler):
@@ -117,9 +117,23 @@ def _migrate_save_v2_to_v3(payload):
     return migrated
 
 
+def _migrate_save_v3_to_v4(payload):
+    migrated = dict(payload)
+    world = migrated.get("world")
+    if not isinstance(world, World):
+        raise ValueError("Data dunia tidak ditemukan pada save.")
+    world.migrate_save()
+    migrated["ledger_schema_version"] = getattr(
+        world, "ledger", None
+    ).schema_version
+    migrated["schema_version"] = 4
+    return migrated
+
+
 SAVE_MIGRATIONS = {
     1: _migrate_save_v1_to_v2,
     2: _migrate_save_v2_to_v3,
+    3: _migrate_save_v3_to_v4,
 }
 
 
